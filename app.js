@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v13";
+const BUILD = "v14";
 
 const C = {
   bg: "#F3EFE6",
@@ -1007,6 +1007,9 @@ class App extends Component {
       padding: "12px 14px",
       fontSize: 14,
       outline: "none",
+      // input / textarea は既定の最小幅を持つため、flex や grid の中で縮まずに
+      // 隣のボタンを枠外へ押し出す。0 にして必ず親幅に収める。
+      minWidth: 0,
     };
     const primary = {
       background: C.ink,
@@ -1390,7 +1393,12 @@ class App extends Component {
               onInput=${(e) => this.setState({ qBack: e.target.value })}
               style=${Object.assign({}, field, { resize: "vertical" })}
             ></textarea>
-            <button style=${Object.assign({}, primary, { height: "100%" })} onClick=${() => this.quickAdd()}>追加</button>
+            <button
+              style=${Object.assign({}, primary, { height: "100%", flexShrink: 0, whiteSpace: "nowrap" })}
+              onClick=${() => this.quickAdd()}
+            >
+              追加
+            </button>
           </div>
           <div style=${{ fontSize: 11, color: C.ghost, marginTop: 8 }}>続けて入力すれば何枚でも追加できます。</div>
         </div>`}
@@ -1413,7 +1421,9 @@ class App extends Component {
             onInput=${(e) => this.setState({ newDeckName: e.target.value })}
             style=${Object.assign({}, field, { flex: 1 })}
           />
-          <button style=${primary} onClick=${() => this.createDeck()}>作成</button>
+          <button style=${Object.assign({}, primary, { flexShrink: 0, whiteSpace: "nowrap" })} onClick=${() => this.createDeck()}>
+            作成
+          </button>
         </div>`}
 
         ${!s.decks.length &&
