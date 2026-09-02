@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v17";
+const BUILD = "v18";
 
 const C = {
   bg: "#F3EFE6",
@@ -376,9 +376,22 @@ class App extends Component {
   }
 
   // 評価に応じて次回出題日を決める。ここが暗記アプリの心臓部。
+  // hard < good < easy が必ず成り立つように、3つの間隔をまとめて出します。
+  // 倍率の丸めや ease の下限のせいで「むずかしい」と「できた」が同じ日数になるのを防ぐためです。
+  intervals(card) {
+    const iv = card.interval;
+    if (!iv) return { hard: 1, good: 2, easy: 4 }; // 初回（新規・学習中）
+    const hard = Math.max(iv + 1, Math.ceil(iv * 1.2));
+    const good = Math.max(hard + 1, Math.round(iv * card.ease));
+    const easyEase = Math.min(3.2, card.ease + 0.15);
+    const easy = Math.max(good + 1, Math.round(iv * easyEase * 1.3));
+    return { hard: hard, good: good, easy: easy };
+  }
+
   schedule(card, grade) {
     const c = Object.assign({}, card);
     const now = Date.now();
+    const iv = this.intervals(card);
     c.reps += 1;
     if (grade === "again") {
       c.ease = Math.max(1.3, c.ease - 0.2);
@@ -387,16 +400,16 @@ class App extends Component {
       c.due = now; // 同一セッション内で再出題
     } else if (grade === "hard") {
       c.ease = Math.max(1.3, c.ease - 0.15);
-      c.interval = c.interval ? Math.max(1, Math.round(c.interval * 1.2)) : 1;
+      c.interval = iv.hard;
       c.state = "review";
       c.due = now + c.interval * DAY;
     } else if (grade === "good") {
-      c.interval = c.interval ? Math.round(c.interval * c.ease) : c.state === "new" ? 1 : 2;
+      c.interval = iv.good;
       c.state = "review";
       c.due = now + c.interval * DAY;
     } else {
       c.ease = Math.min(3.2, c.ease + 0.15);
-      c.interval = c.interval ? Math.round(c.interval * c.ease * 1.3) : 4;
+      c.interval = iv.easy;
       c.state = "review";
       c.due = now + c.interval * DAY;
     }
