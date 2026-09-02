@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v18";
+const BUILD = "v19";
 
 const C = {
   bg: "#F3EFE6",
@@ -67,6 +67,32 @@ function dayKey(t) {
     String(d.getMonth() + 1).padStart(2, "0") +
     "-" +
     String(d.getDate()).padStart(2, "0")
+  );
+}
+
+// 出題は日単位で扱います。due はその日の 0 時に揃え、答えた時刻に左右されないようにします。
+// 時刻をそのまま入れると、夜に答えたカードが翌々日の同じ時刻まで出てこなくなります。
+function startOfDay(t) {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// n 日後の 0 時。月またぎや夏時間の処理は Date に任せます。
+function addDays(t, n) {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + n);
+  return d.getTime();
+}
+
+// 保存済みカードの due を日の境界へ揃えます（旧版は答えた時刻をそのまま持っていました）。
+// 読み込み経路すべてに通すので、端末に残っている古いデータもここで直ります。
+function alignDues(cards) {
+  return (cards || []).map((c) =>
+    c && typeof c.due === "number" && c.due !== startOfDay(c.due)
+      ? Object.assign({}, c, { due: startOfDay(c.due) })
+      : c
   );
 }
 
@@ -266,6 +292,8 @@ class App extends Component {
     // 以前の版が入れたサンプルデータが保存されていれば、ここで取り除きます。
     const stripped = stripSample(data);
     data = stripped.data;
+    // 旧版は due に答えた時刻をそのまま入れていたので、日の境界へ揃えます。
+    if (data && data.cards) data.cards = alignDues(data.cards);
     this._sampleStripped = stripped.changed;
     // この端末に既に学習データがあったか。真ならログイン画面を挟まず今までどおり表示します
     // （ログインを促した結果、手元のデータが見えなくなる事故を防ぐため）。
@@ -402,16 +430,16 @@ class App extends Component {
       c.ease = Math.max(1.3, c.ease - 0.15);
       c.interval = iv.hard;
       c.state = "review";
-      c.due = now + c.interval * DAY;
+      c.due = addDays(now, c.interval);
     } else if (grade === "good") {
       c.interval = iv.good;
       c.state = "review";
-      c.due = now + c.interval * DAY;
+      c.due = addDays(now, c.interval);
     } else {
       c.ease = Math.min(3.2, c.ease + 0.15);
       c.interval = iv.easy;
       c.state = "review";
-      c.due = now + c.interval * DAY;
+      c.due = addDays(now, c.interval);
     }
     return c;
   }
@@ -427,7 +455,12 @@ class App extends Component {
     const tally = Object.assign({}, this.state.tally);
     tally[grade] += 1;
     const history = this.state.history.concat([
-      { card: card, queue: this.state.queue, tally: this.state.tally },
+      {
+        card: card,
+        queue: this.state.queue,
+        tally: this.state.tally,
+        gradeTotals: this.state.gradeTotals,
+      },
     ]);
     const k = dayKey(Date.now());
     const log = Object.assign({}, this.state.log);
@@ -461,6 +494,7 @@ class App extends Component {
       cards,
       queue: last.queue,
       tally: last.tally,
+      gradeTotals: last.gradeTotals || this.state.gradeTotals,
       history: h2,
       log,
       todayCount: Math.max(0, this.state.todayCount - 1),
@@ -475,7 +509,7 @@ class App extends Component {
     const id = this.state.queue[0];
     const queue = this.state.queue.slice(1);
     const cards = this.state.cards.map((c) =>
-      c.id === id ? Object.assign({}, c, { due: Date.now() + DAY }) : c
+      c.id === id ? Object.assign({}, c, { due: addDays(Date.now(), 1) }) : c
     );
     const next = { cards, queue, showAnswer: false, screen: queue.length ? "study" : "done" };
     this.setState(next);
@@ -503,18 +537,17 @@ class App extends Component {
 
   intervalLabel(card, grade) {
     if (!card) return "";
-    if (grade === "again") return "10分後";
+    if (grade === "again") return "セッション内";
     const d = this.schedule(card, grade).interval;
-    if (d < 1) return "10分後";
+    if (d < 1) return "セッション内";
     if (d === 1) return "1日後";
     if (d < 30) return d + "日後";
     return Math.round(d / 30) + "か月後";
   }
 
   dueLabel(card) {
-    const diff = card.due - Date.now();
-    if (diff <= 0) return card.state === "new" ? "未学習" : "復習待ち";
-    const d = Math.ceil(diff / DAY);
+    if (card.due <= Date.now()) return card.state === "new" ? "未学習" : "復習待ち";
+    const d = Math.max(1, Math.round((startOfDay(card.due) - startOfDay(Date.now())) / DAY));
     return d === 1 ? "明日" : d + "日後";
   }
 
@@ -783,7 +816,7 @@ class App extends Component {
         const d = stripSample(data.data).data;
         const next = {
           decks: d.decks || [],
-          cards: d.cards || [],
+          cards: alignDues(d.cards),
           log: d.log || {},
           gradeTotals: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
           todayCount: (d.log && d.log[dayKey(Date.now())]) || 0,
@@ -892,7 +925,7 @@ class App extends Component {
         const d = JSON.parse(r.result);
         const next = {
           decks: d.decks || [],
-          cards: d.cards || [],
+          cards: alignDues(d.cards),
           log: d.log || {},
           gradeTotals: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
           todayCount: (d.log && d.log[dayKey(Date.now())]) || 0,
@@ -969,10 +1002,12 @@ class App extends Component {
     }));
 
     const fc = [];
+    const today = startOfDay(now);
     for (let i = 0; i < 7; i++) {
-      const from = i === 0 ? 0 : now + i * DAY - DAY / 2;
-      const to = now + i * DAY + DAY / 2;
-      const n = cards.filter((c) => (i === 0 ? c.due <= now : c.due > from && c.due <= to)).length;
+      const n = cards.filter((c) => {
+        const d = Math.round((startOfDay(c.due) - today) / DAY);
+        return i === 0 ? d <= 0 : d === i;
+      }).length;
       fc.push({ i, n, label: i === 0 ? "今日" : i === 1 ? "明日" : "+" + i + "日" });
     }
     const fcMax = Math.max.apply(null, fc.map((f) => f.n).concat([1]));
