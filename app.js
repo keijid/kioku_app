@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v8";
+const BUILD = "v9";
 
 const C = {
   bg: "#F3EFE6",
@@ -491,6 +491,58 @@ class App extends Component {
     }
   }
 
+  // エラー文言に app.js のどの行で起きたかを添える（古い版が動いていないかの確認用）。
+  errText(e) {
+    const msg = String((e && e.message) || e);
+    const line =
+      e && e.stack
+        ? String(e.stack)
+            .split("\n")
+            .map((l) => l.trim())
+            .find((l) => l.indexOf("app.js") >= 0)
+        : "";
+    return line ? msg + "\n（" + BUILD + " / " + line.slice(0, 120) + "）" : msg + "\n（" + BUILD + "）";
+  }
+
+  // 同期がうまくいかないときに、どのCDNが何を返しているかを画面に出します。
+  async diagnose() {
+    const c = this.cfg();
+    const lines = ["診断結果  ビルド " + BUILD];
+    if (!c || !c.url || !c.key) {
+      lines.push("接続情報が未設定です");
+      this.setState({ syncError: lines.join("\n") });
+      return;
+    }
+    lines.push("接続先 " + c.url + " / キー " + c.key.slice(0, 8) + "…（" + c.key.length + "文字）");
+    this.setState({ syncBusy: true, syncError: lines.join("\n") + "\n診断中…" });
+    for (let i = 0; i < SB_SOURCES.length; i++) {
+      const src = SB_SOURCES[i];
+      const where = new URL(src).hostname + (src.indexOf("+esm") >= 0 ? "(+esm)" : "");
+      try {
+        const m = await import(src);
+        const create = m.createClient || (m.default && m.default.createClient);
+        if (typeof create !== "function") {
+          lines.push(where + "：createClient なし [" + Object.keys(m).slice(0, 6).join(",") + "]");
+          continue;
+        }
+        const cl = create(c.url, c.key, { auth: { persistSession: false } });
+        lines.push(
+          where +
+            "：client=" +
+            (cl ? typeof cl : "なし") +
+            " auth=" +
+            (cl && cl.auth ? typeof cl.auth : "なし") +
+            " signIn=" +
+            (cl && cl.auth ? typeof cl.auth.signInWithPassword : "-")
+        );
+      } catch (e) {
+        lines.push(where + "：失敗 " + String((e && e.message) || e).slice(0, 100));
+      }
+      this.setState({ syncError: lines.join("\n") });
+    }
+    this.setState({ syncBusy: false, syncError: lines.join("\n") });
+  }
+
   async loadSb() {
     const c = this.cfg();
     if (!c || !c.url || !c.key) throw new Error("接続情報が未設定です");
@@ -550,7 +602,7 @@ class App extends Component {
       }
       if (user) this.pull(true);
     } catch (e) {
-      this.setState({ syncError: String(e.message || e) });
+      this.setState({ syncError: this.errText(e) });
     }
   }
 
@@ -585,7 +637,7 @@ class App extends Component {
       this.toast("ログインしました");
       this.pull(true);
     } catch (e) {
-      this.setState({ syncBusy: false, syncError: String(e.message || e) });
+      this.setState({ syncBusy: false, syncError: this.errText(e) });
     }
   }
 
@@ -617,7 +669,7 @@ class App extends Component {
       localStorage.setItem("kioku.sync.at", at);
       this.setState({ syncBusy: false, syncAt: at });
     } catch (e) {
-      this.setState({ syncBusy: false, syncError: String(e.message || e) });
+      this.setState({ syncBusy: false, syncError: this.errText(e) });
     }
   }
 
@@ -660,7 +712,7 @@ class App extends Component {
         if (!silent) this.toast("この端末のデータをアップロードしました");
       }
     } catch (e) {
-      this.setState({ syncBusy: false, syncError: String(e.message || e) });
+      this.setState({ syncBusy: false, syncError: this.errText(e) });
     }
   }
 
@@ -2338,6 +2390,8 @@ class App extends Component {
             fontSize: 13,
             lineHeight: 1.6,
             marginBottom: 16,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
           }}
         >
           ${s.syncError}
@@ -2499,6 +2553,14 @@ class App extends Component {
           <button
             class="soft"
             style=${Object.assign({}, secondary, { marginLeft: "auto", padding: "10px 16px", fontSize: 12 })}
+            disabled=${s.syncBusy}
+            onClick=${() => this.diagnose()}
+          >
+            接続を診断
+          </button>
+          <button
+            class="soft"
+            style=${Object.assign({}, secondary, { padding: "10px 16px", fontSize: 12 })}
             onClick=${() => this.forceUpdate()}
           >
             アプリを最新にする
