@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v10";
+const BUILD = "v11";
 
 const C = {
   bg: "#F3EFE6",
@@ -38,6 +38,14 @@ const SB_SOURCES = [
   "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm",
   "https://esm.sh/@supabase/supabase-js@2",
 ];
+
+// 既定の保存先。ここに値を入れておくと、利用者は接続情報を貼らずメールとパスワードだけで始められます。
+// publishable key はブラウザに配られる公開キーで、実際の保護は kioku_state の RLS（SQL_SETUP）が担っています。
+// secret key は絶対に置かないこと。空のままなら、従来どおり画面から保存先を手入力します。
+const DEFAULT_SB = {
+  url: "",
+  key: "",
+};
 
 const SQL_SETUP = [
   "create table if not exists kioku_state (",
@@ -257,6 +265,11 @@ class App extends Component {
     syncBusy: false,
     syncError: null,
     syncAt: null,
+    // 入口（ログイン画面）
+    booting: false, // 保存済みセッションの復元待ち。ログイン画面のちらつき防止
+    localOnly: false, // 「この端末だけで使う」を選んだ
+    authMode: "in", // ログイン画面のタブ "in" | "up"
+    syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
   };
 
   componentDidMount() {
@@ -264,7 +277,10 @@ class App extends Component {
     try {
       data = JSON.parse(localStorage.getItem("kioku.mvp.v1") || "null");
     } catch (e) {}
-    if (!data || !data.cards || !data.cards.length) data = seed();
+    // この端末に既に学習データがあったか。真ならログイン画面を挟まず今までどおり表示します
+    // （ログインを促した結果、手元のデータが見えなくなる事故を防ぐため）。
+    this._hadSavedData = !!(data && data.cards && data.cards.length);
+    if (!this._hadSavedData) data = seed();
     const log = data.log || seedLog();
     this.setState({
       decks: data.decks,
@@ -285,6 +301,14 @@ class App extends Component {
 
     const c = this.cfg();
     if (c) this.setState({ sbUrl: c.url, sbKey: c.key, syncAt: localStorage.getItem("kioku.sync.at") });
+    // セッションが残っていれば復元が終わるまで待つ。ログイン済みの端末に
+    // ログイン画面が一瞬映らないようにするためです（SDK は CDN から非同期に読み込むので）。
+    const hasSession = !!localStorage.getItem("kioku.sb.auth");
+    this._hadStoredSession = hasSession;
+    this.setState({
+      localOnly: localStorage.getItem("kioku.localonly") === "1",
+      booting: !!c && hasSession,
+    });
     this.initSync();
   }
 
@@ -483,12 +507,29 @@ class App extends Component {
 
   // ---- クラウド同期（Supabase・任意） ----
 
+  // 保存先。端末で設定したものがあればそれを、なければ DEFAULT_SB を使います。
   cfg() {
     try {
-      return JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
+      const saved = JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
+      if (saved && saved.url && saved.key) return saved;
+    } catch (e) {}
+    return DEFAULT_SB.url && DEFAULT_SB.key ? DEFAULT_SB : null;
+  }
+
+  // 端末で保存先を上書きしているか（同期画面で「別の保存先」の表示を出し分けるのに使います）。
+  hasOwnCfg() {
+    try {
+      const saved = JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
+      return !!(saved && saved.url && saved.key);
     } catch (e) {
-      return null;
+      return false;
     }
+  }
+
+  // ログインできた／ローカル専用をやめたときに呼びます。
+  leaveLocalOnly() {
+    localStorage.removeItem("kioku.localonly");
+    if (this.state.localOnly) this.setState({ localOnly: false });
   }
 
   // エラー文言に app.js のどの行で起きたかを添える（古い版が動いていないかの確認用）。
@@ -598,24 +639,33 @@ class App extends Component {
   }
 
   async initSync() {
-    if (!this.cfg()) return;
+    if (!this.cfg()) {
+      this.setState({ booting: false });
+      return;
+    }
     try {
       const sb = await this.loadSb();
       const { data } = await sb.auth.getSession();
       const user = data && data.session ? data.session.user : null;
-      this.setState({ syncUser: user ? user.email : null });
+      this.setState({ syncUser: user ? user.email : null, booting: false });
+      if (user) this.leaveLocalOnly();
       if (!this._authSub) {
         this._authSub = sb.auth.onAuthStateChange((evt, session) => {
           const u = session ? session.user.email : null;
           if (u !== this.state.syncUser) {
             this.setState({ syncUser: u });
-            if (u) this.pull(true);
+            if (u) {
+              this.leaveLocalOnly();
+              this.pull(true);
+            }
           }
         });
       }
       if (user) this.pull(true);
     } catch (e) {
-      this.setState({ syncError: this.errText(e) });
+      // 復元するセッションが無いなら、まだ何もしていない人にエラーを見せる必要はありません。
+      // 実際に困るのはログインを押したときで、そこで同じエラーが出ます。
+      this.setState({ syncError: this._hadStoredSession ? this.errText(e) : null, booting: false });
     }
   }
 
@@ -646,7 +696,14 @@ class App extends Component {
         });
         return;
       }
-      this.setState({ syncUser: data.session.user.email, syncPw: "", syncBusy: false, syncError: null });
+      this.leaveLocalOnly();
+      this.setState({
+        syncUser: data.session.user.email,
+        syncPw: "",
+        syncBusy: false,
+        syncError: null,
+        screen: this.state.screen === "login" ? "home" : this.state.screen,
+      });
       this.toast("ログインしました");
       this.pull(true);
     } catch (e) {
@@ -659,7 +716,9 @@ class App extends Component {
       const sb = await this.loadSb();
       await sb.auth.signOut();
     } catch (e) {}
-    this.setState({ syncUser: null, syncAt: null });
+    // 手元の学習データは消しません。入口のログイン画面に戻すだけです。
+    this.setState({ syncUser: null, syncAt: null, localOnly: false, syncPw: "", syncError: null, screen: "login" });
+    localStorage.removeItem("kioku.localonly");
     this.toast("ログアウトしました");
   }
 
@@ -768,12 +827,21 @@ class App extends Component {
     this.initSync();
   }
 
+  // 端末で上書きした保存先を捨てます。DEFAULT_SB があればそちらに戻ります。
   clearCfg() {
     localStorage.removeItem("kioku.sync.cfg");
     localStorage.removeItem("kioku.sync.at");
     this._sbClient = null;
-    this.setState({ syncUser: null, syncAt: null, sbUrl: "", sbKey: "" });
-    this.toast("接続を解除しました");
+    const back = DEFAULT_SB.url && DEFAULT_SB.key;
+    this.setState({
+      syncUser: null,
+      syncAt: null,
+      sbUrl: back ? DEFAULT_SB.url : "",
+      sbKey: back ? DEFAULT_SB.key : "",
+      syncError: null,
+    });
+    this.toast(back ? "既定の保存先に戻しました" : "接続を解除しました");
+    if (back) this.initSync();
   }
 
   // 端末に古い版が残ったときの逃げ道。キャッシュとService Workerを捨てて読み直します。
@@ -966,35 +1034,58 @@ class App extends Component {
     };
     const h2Style = { margin: 0, fontSize: n ? 22 : 28, fontWeight: 700 };
 
+    const toast =
+      s.toast &&
+      html`<div
+        style=${{
+          position: "fixed",
+          left: "50%",
+          bottom: "calc(28px + env(safe-area-inset-bottom))",
+          transform: "translateX(-50%)",
+          background: C.ink,
+          color: C.bg,
+          padding: "12px 22px",
+          borderRadius: 999,
+          fontSize: 13,
+          boxShadow: "0 10px 30px rgba(28,34,48,.25)",
+          animation: "kk-rise .2s ease both",
+          zIndex: 50,
+        }}
+      >
+        ${s.toast}
+      </div>`;
+
+    // 入口の出し分け。保存先が決まっていて未ログインなら、デッキ一覧の手前にログイン画面を挟みます。
+    // ただし、この端末に既に学習データがある人と「この端末だけで使う」を選んだ人は素通しします
+    // （明示的に screen を "login" にしたときは、そのときだけ出します）。
+    const gate = !!this.cfg() && !s.syncUser;
+    const showLogin = gate && !s.booting && (s.screen === "login" || (!s.localOnly && !this._hadSavedData));
+    if (gate && s.booting) {
+      return html`
+        <div style=${{ minHeight: "100vh", background: C.bg, display: "grid", placeItems: "center" }}>
+          <div style=${{ fontSize: 13, color: C.faint }}>読み込み中…</div>
+        </div>
+      `;
+    }
+    if (showLogin) {
+      return html`
+        <div style=${{ minHeight: "100vh", background: C.bg, padding: "0 20px 60px" }}>
+          ${this.renderLogin(box, field, primary, secondary)} ${toast}
+        </div>
+      `;
+    }
+
     return html`
       <div style=${{ minHeight: "100vh", background: C.bg, padding: "0 20px 80px" }}>
         ${this.renderHeader(st)}
-        ${s.screen === "home" && this.renderHome(st, box, field, primary)}
+        ${(s.screen === "home" || s.screen === "login") && this.renderHome(st, box, field, primary)}
         ${s.screen === "study" && this.renderStudy()}
         ${s.screen === "done" && this.renderDone()}
         ${s.screen === "deck" && this.renderDeck(box, field, primary, backLink, h2Style)}
         ${s.screen === "import" && this.renderImport(box, field, primary, secondary, backLink, h2Style)}
         ${s.screen === "stats" && this.renderStats(st, box, backLink, h2Style)}
         ${s.screen === "sync" && this.renderSync(box, field, primary, secondary, backLink, h2Style)}
-        ${s.toast &&
-        html`<div
-          style=${{
-            position: "fixed",
-            left: "50%",
-            bottom: "calc(28px + env(safe-area-inset-bottom))",
-            transform: "translateX(-50%)",
-            background: C.ink,
-            color: C.bg,
-            padding: "12px 22px",
-            borderRadius: 999,
-            fontSize: 13,
-            boxShadow: "0 10px 30px rgba(28,34,48,.25)",
-            animation: "kk-rise .2s ease both",
-            zIndex: 50,
-          }}
-        >
-          ${s.toast}
-        </div>`}
+        ${toast}
       </div>
     `;
   }
@@ -1105,6 +1196,41 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        ${!s.syncUser &&
+        !!this.cfg() &&
+        html`<div
+          style=${{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+            background: C.surface,
+            border: "1px solid " + C.line,
+            borderRadius: 14,
+            padding: "11px 16px",
+            marginBottom: 16,
+          }}
+        >
+          <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
+            いまはこの端末の中だけに保存されています。ログインすると他の端末と同じ状態になります。
+          </div>
+          <button
+            class="soft"
+            style=${{
+              background: C.bg,
+              border: "1px solid " + C.line,
+              color: C.inkSoft,
+              borderRadius: 999,
+              padding: "8px 16px",
+              fontSize: 12,
+              flexShrink: 0,
+            }}
+            onClick=${() => this.setState({ screen: "login", syncError: null })}
+          >
+            ログイン
+          </button>
+        </div>`}
         <section
           style=${{
             background: C.ink,
@@ -2358,9 +2484,176 @@ class App extends Component {
     `;
   }
 
+  // 入口。デッキやカードを見る前に、ここでログインします。
+  // 保存先（URLとキー）は DEFAULT_SB に持たせているので、ここで聞くのはメールとパスワードだけです。
+  renderLogin(box, field, primary, secondary) {
+    const s = this.state;
+    const up = s.authMode === "up";
+    const tab = (on) => ({
+      flex: 1,
+      background: on ? C.surface : "none",
+      border: "1px solid " + (on ? C.line : "transparent"),
+      color: on ? C.ink : C.faint,
+      borderRadius: 999,
+      padding: "9px 0",
+      fontSize: 13,
+      fontWeight: on ? 700 : 400,
+    });
+    // 手元に学習データがある人と、いちどローカル専用を選んだ人は、ログインせずに戻れます。
+    const canGoBack = !!this._hadSavedData || s.localOnly;
+    const submit = () => this.signIn(s.authMode);
+    const onEnter = (e) => {
+      if (e.key === "Enter") submit();
+    };
+
+    return html`
+      <main
+        style=${{
+          maxWidth: 420,
+          margin: "0 auto",
+          paddingTop: s.narrow ? 48 : 88,
+          animation: "kk-rise .3s ease both",
+        }}
+      >
+        <div style=${{ display: "grid", justifyItems: "center", gap: 12, marginBottom: 30 }}>
+          <div
+            style=${{
+              width: 52,
+              height: 52,
+              borderRadius: 16,
+              background: C.ink,
+              color: C.bg,
+              display: "grid",
+              placeItems: "center",
+              fontFamily: "'Zen Old Mincho', serif",
+              fontSize: 27,
+              fontWeight: 700,
+            }}
+          >
+            記
+          </div>
+          <div style=${{ textAlign: "center" }}>
+            <div style=${{ fontSize: 21, fontWeight: 700, letterSpacing: ".04em" }}>キオク</div>
+            <div style=${{ fontSize: 11, color: C.faint, letterSpacing: ".14em", marginTop: 3 }}>SPACED REPETITION</div>
+          </div>
+        </div>
+
+        <div style=${box}>
+          <div
+            style=${{
+              display: "flex",
+              gap: 4,
+              background: C.field,
+              border: "1px solid " + C.lineSoft,
+              borderRadius: 999,
+              padding: 4,
+              marginBottom: 18,
+            }}
+          >
+            <button
+              class="ghost"
+              style=${tab(!up)}
+              onClick=${() => this.setState({ authMode: "in", syncError: null })}
+            >
+              ログイン
+            </button>
+            <button
+              class="ghost"
+              style=${tab(up)}
+              onClick=${() => this.setState({ authMode: "up", syncError: null })}
+            >
+              新規登録
+            </button>
+          </div>
+
+          <div style=${{ display: "grid", gap: 10 }}>
+            <input
+              type="email"
+              autocomplete="email"
+              placeholder="メールアドレス"
+              value=${s.syncEmail}
+              onInput=${(e) => this.setState({ syncEmail: e.target.value })}
+              onKeyDown=${onEnter}
+              style=${Object.assign({}, field, { fontSize: 14 })}
+            />
+            <input
+              type="password"
+              autocomplete=${up ? "new-password" : "current-password"}
+              placeholder="パスワード（6文字以上）"
+              value=${s.syncPw}
+              onInput=${(e) => this.setState({ syncPw: e.target.value })}
+              onKeyDown=${onEnter}
+              style=${Object.assign({}, field, { fontSize: 14 })}
+            />
+            <button
+              class="cta"
+              disabled=${s.syncBusy}
+              style=${Object.assign({}, primary, { width: "100%", marginTop: 4 })}
+              onClick=${submit}
+            >
+              ${s.syncBusy ? "通信中…" : up ? "登録してはじめる" : "ログイン"}
+            </button>
+          </div>
+
+          <div style=${{ fontSize: 12, color: C.faint, lineHeight: 1.8, marginTop: 14 }}>
+            ${up
+              ? "登録すると、学習履歴とカードが複数の端末で同じ状態になります。"
+              : "はじめての方は「新規登録」を選んでください。"}
+          </div>
+        </div>
+
+        ${s.syncError &&
+        html`<div
+          style=${{
+            background: "#FBEDE9",
+            border: "1px solid #EFCFC5",
+            color: "#8E3320",
+            borderRadius: 14,
+            padding: "14px 16px",
+            fontSize: 13,
+            lineHeight: 1.6,
+            marginTop: 16,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          ${s.syncError}
+        </div>`}
+
+        <div style=${{ textAlign: "center", marginTop: 22 }}>
+          ${canGoBack
+            ? html`<button
+                class="ghost"
+                style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "8px 12px" }}
+                onClick=${() => this.setState({ screen: "home", syncError: null, syncPw: "" })}
+              >
+                ← デッキ一覧に戻る
+              </button>`
+            : html`<button
+                  class="ghost"
+                  style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "8px 12px" }}
+                  onClick=${() => {
+                    localStorage.setItem("kioku.localonly", "1");
+                    this.setState({ localOnly: true, screen: "home", syncError: null, syncPw: "" });
+                  }}
+                >
+                  ログインせずにこの端末だけで使う
+                </button>
+                <div style=${{ fontSize: 11, color: C.ghost, lineHeight: 1.7, marginTop: 4 }}>
+                  この端末の中だけに保存されます。あとから「同期」画面でログインできます。
+                </div>`}
+        </div>
+
+        <div style=${{ textAlign: "center", fontSize: 11, color: C.ghost, marginTop: 26 }}>ビルド ${BUILD}</div>
+      </main>
+    `;
+  }
+
   renderSync(box, field, primary, secondary, backLink, h2Style) {
     const s = this.state;
     const cfg = this.cfg();
+    const own = this.hasOwnCfg(); // 端末で保存先を上書きしているか
+    const advOpen = s.syncAdvanced || !cfg; // 保存先が決まっていないときは開いた状態で出す
     const status = s.syncBusy
       ? "同期中…"
       : s.syncAt
@@ -2389,7 +2682,7 @@ class App extends Component {
           </span>
         </div>
         <div style=${{ fontSize: 13, color: C.faint, margin: "6px 0 22px", lineHeight: 1.7 }}>
-          ログインすると、学習履歴とカードが複数の端末で同じ状態になります。設定しない場合はこの端末の中だけに保存されます。
+          ログインすると、学習履歴とカードが複数の端末で同じ状態になります。ログインしない場合はこの端末の中だけに保存されます。
         </div>
 
         ${s.syncError &&
@@ -2410,9 +2703,25 @@ class App extends Component {
           ${s.syncError}
         </div>`}
 
-        ${!cfg &&
+        ${!!cfg &&
+        html`<button
+          class="ghost"
+          style=${{
+            background: "none",
+            border: "none",
+            color: C.faint,
+            fontSize: 12,
+            padding: "6px 0",
+            marginBottom: 12,
+          }}
+          onClick=${() => this.setState({ syncAdvanced: !s.syncAdvanced })}
+        >
+          ${(s.syncAdvanced ? "▾ " : "▸ ") + "別の保存先を使う（自分の Supabase プロジェクト）"}
+        </button>`}
+
+        ${advOpen &&
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
-          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>ステップ1：保存先を用意する</div>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>保存先を用意する</div>
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.8, marginBottom: 14 }}>
             <a href="https://supabase.com" target="_blank" rel="noreferrer">Supabase</a>
             で無料プロジェクトを作り、SQL Editor に下のSQLを貼って実行します。次に Project Settings → API から
@@ -2454,8 +2763,9 @@ class App extends Component {
           </button>
         </div>`}
 
-        <div style=${Object.assign({}, box, { marginBottom: 16 })}>
-          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>ステップ2：接続情報</div>
+        ${advOpen &&
+        html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>接続情報</div>
           <div style=${{ display: "grid", gap: 10 }}>
             <input
               placeholder="https://xxxxx.supabase.co"
@@ -2471,17 +2781,17 @@ class App extends Component {
             />
             <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <button style=${primary} onClick=${() => this.saveCfg()}>保存して接続</button>
-              ${cfg &&
+              ${own &&
               html`<button class="danger" style=${Object.assign({}, secondary, { background: "none", color: C.faint })} onClick=${() => this.clearCfg()}>
-                接続を解除
+                ${DEFAULT_SB.url && DEFAULT_SB.key ? "既定の保存先に戻す" : "接続を解除"}
               </button>`}
             </div>
           </div>
-        </div>
+        </div>`}
 
         ${cfg &&
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
-          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>ステップ3：ログイン</div>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>アカウント</div>
           ${!s.syncUser
             ? html`<div style=${{ display: "grid", gap: 10 }}>
                 <input

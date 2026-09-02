@@ -72,9 +72,10 @@ gradeTotals = { again, hard, good, easy }  // 累計（正答率の算出用）
 
 **localStorage のキー**
 - `kioku.mvp.v1` — decks / cards / log / gradeTotals / todayCount
-- `kioku.sync.cfg` — Supabase の URL と publishable key
+- `kioku.sync.cfg` — Supabase の URL と publishable key（端末で保存先を上書きしたときだけ入ります）
 - `kioku.sync.at` — 最終同期時刻（競合判定に使用）
 - `kioku.sb.auth` — Supabase のセッション（Supabase SDK が管理）
+- `kioku.localonly` — 入口で「ログインせずにこの端末だけで使う」を選んだ（`"1"`）
 
 保存は `this.persist(next)` を呼びます。localStorage への書き込みとクラウドへの遅延プッシュを兼ねています。
 **`setState` したら `persist` も呼ぶ**のを忘れないでください（画面表示だけの状態は除く）。
@@ -99,6 +100,10 @@ gradeTotals = { again, hard, good, easy }  // 累計（正答率の算出用）
 
 未設定でもアプリは完全に動きます（端末内保存のみ）。設定した場合：
 
+- 保存先（Project URL と publishable key）は `app.js` の `DEFAULT_SB` に持たせています。
+  利用者が入力するのはメールとパスワードだけです。`DEFAULT_SB` が空のときだけ、
+  同期画面の「別の保存先を使う」から手入力する従来の流れになります
+- `cfg()` は「端末で保存した設定 → `DEFAULT_SB`」の順に返します。localStorage の形式は変えていません
 - Supabase JS SDK は同期を初めて使うときに動的 import します（初期表示を軽くするため）
 - テーブルは `kioku_state`（`user_id` 主キー、`data` jsonb、`updated_at`）の1行だけ。RLSで本人のみ読み書き可
 - 認証はメール＋パスワード
@@ -106,6 +111,20 @@ gradeTotals = { again, hard, good, easy }  // 累計（正答率の算出用）
 - 学習のたびに 2.5 秒のデバウンスで自動プッシュ（`queuePush()`）
 - キーは **publishable key**（`sb_publishable_…`／旧 anon key）。secret key は絶対に使わないこと
 - セットアップSQLは `app.js` の `SQL_SETUP` にあり、アプリ内に表示されます
+
+## 入口（ログイン画面）
+
+デッキやカードを見る前に `renderLogin()` を挟みます。判定は `render()` の先頭にまとめてあります。
+
+- 出す条件：`cfg()` があり、未ログインで、`localOnly` でなく、この端末に学習データが無いとき
+  （`screen` を明示的に `"login"` にしたときも出ます）
+- **この端末に既に学習データがある人（`this._hadSavedData`）は素通し**します。
+  ログインを促した結果、手元のデータが見えなくなる事故を防ぐためです
+- 「ログインせずにこの端末だけで使う」を押すと `kioku.localonly` が立ち、以後は素通しになります。
+  ホームの上部に出る1行バナーからいつでもログイン画面に戻れます
+- `kioku.sb.auth` が残っている端末は `booting` を立てて、セッション復元が終わるまで「読み込み中…」を出します。
+  これをしないと、ログイン済みの端末でログイン画面が一瞬ちらつきます
+- ログアウトしても手元の学習データ（`kioku.mvp.v1`）は消しません。入口に戻すだけです
 
 ## デプロイ
 
