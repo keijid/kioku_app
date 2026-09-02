@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v12";
+const BUILD = "v13";
 
 const C = {
   bg: "#F3EFE6",
@@ -153,7 +153,7 @@ function splitRecords(text, delim) {
   return recs;
 }
 
-// 表 / 裏 / ヒント の3列に振り分ける。4列目以降（Anki のタグなど）は捨てます。
+// 表 / 裏 / 補足 の3列に振り分ける。4列目以降（Anki のタグなど）は捨てます。
 function parseBulk(text, delimKey) {
   const delim = delimKey === "auto" ? guessDelim(text) : delimKey;
   const rows = [];
@@ -225,6 +225,13 @@ class App extends Component {
     qBack: "",
     formFront: "",
     formBack: "",
+    formHint: "",
+    formHintOpen: false, // カード追加フォームで補足欄を開いているか
+    // カードのその場編集。editId が入っている行だけ入力欄に切り替わります
+    editId: null,
+    editFront: "",
+    editBack: "",
+    editHint: "",
     confirmingDelete: false,
     toast: null,
     // 一括取り込み
@@ -1122,7 +1129,7 @@ class App extends Component {
       >
         <div
           style=${{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer", flexShrink: 0 }}
-          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false })}
+          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false, editId: null })}
         >
           <div
             style=${{
@@ -1514,7 +1521,7 @@ class App extends Component {
                   </button>
                   <button
                     class="soft"
-                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false })}
+                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false, editId: null })}
                     style=${{
                       background: C.bg,
                       border: "1px solid " + C.line,
@@ -1547,13 +1554,14 @@ class App extends Component {
     this.toast("デッキを作成しました");
   }
 
-  newCard(deckId, front, back) {
+  // hint は「補足」（単語なら例文、用語なら説明文）。答えを見たあとに一緒に表示します。
+  newCard(deckId, front, back, hint) {
     return {
       id: uid("c"),
       deckId,
       front,
       back,
-      hint: "",
+      hint: (hint || "").trim(),
       ease: 2.5,
       interval: 0,
       reps: 0,
@@ -1649,11 +1657,7 @@ class App extends Component {
     }
     if (deckCreated) decks = decks.concat([{ id: deckId, name: deckName, sub: "取り込んだデッキ" }]);
 
-    const added = p.keep.slice(0, IMPORT_MAX).map((r) => {
-      const c = this.newCard(deckId, r.front, r.back);
-      c.hint = r.hint;
-      return c;
-    });
+    const added = p.keep.slice(0, IMPORT_MAX).map((r) => this.newCard(deckId, r.front, r.back, r.hint));
     const cards = s.cards.concat(added);
     const next = {
       decks,
@@ -1769,7 +1773,24 @@ class App extends Component {
                 <div style=${{ fontSize: n ? 19 : 24, lineHeight: 1.6, color: "#2E3648", textWrap: "pretty" }}>
                   ${card ? card.back : ""}
                 </div>
-                <div style=${{ marginTop: 10, fontSize: 13, color: C.faint }}>${card ? card.hint : ""}</div>
+                ${card &&
+                card.hint &&
+                html`<div
+                  style=${{
+                    marginTop: 18,
+                    padding: n ? "12px 14px" : "14px 18px",
+                    background: C.bg,
+                    borderRadius: 12,
+                    fontSize: n ? 14 : 15,
+                    lineHeight: 1.8,
+                    color: C.muted,
+                    textAlign: "left",
+                    whiteSpace: "pre-wrap",
+                    textWrap: "pretty",
+                  }}
+                >
+                  ${card.hint}
+                </div>`}
               </div>`}
             </div>
           </div>
@@ -1913,7 +1934,7 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
-        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false })}>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false, editId: null })}>
           ← デッキ一覧
         </button>
         <div
@@ -2051,60 +2072,213 @@ class App extends Component {
             ></textarea>
             <button style=${Object.assign({}, primary, { height: "100%" })} onClick=${() => this.addCard()}>追加</button>
           </div>
+          ${s.formHintOpen
+            ? html`<textarea
+                rows="3"
+                placeholder="補足：例文・説明（省略可）"
+                value=${s.formHint}
+                onInput=${(e) => this.setState({ formHint: e.target.value })}
+                style=${Object.assign({}, field, { width: "100%", resize: "vertical", marginTop: 10, lineHeight: 1.7 })}
+              ></textarea>`
+            : html`<button
+                class="ghost"
+                style=${{
+                  marginTop: 10,
+                  background: "none",
+                  border: "none",
+                  color: C.faint,
+                  fontSize: 12,
+                  padding: "4px 0",
+                }}
+                onClick=${() => this.setState({ formHintOpen: true })}
+              >
+                ＋ 補足（例文・説明）を追加
+              </button>`}
         </div>
 
         <div style=${{ display: "grid", gap: 8 }}>
-          ${cards.map(
-            (c) => html`
-              <div
-                key=${c.id}
-                style=${{
-                  background: C.surface,
-                  border: "1px solid " + C.line,
-                  borderRadius: 12,
-                  padding: "14px 16px",
-                  display: "grid",
-                  gridTemplateColumns: n ? "1fr 34px" : "1fr 1fr 96px 34px",
-                  gap: 10,
-                  alignItems: "center",
-                }}
-              >
-                <div style=${n ? { fontSize: 14, fontWeight: 500, gridColumn: "1", gridRow: "1" } : { fontSize: 14, fontWeight: 500 }}>
-                  ${c.front}
-                </div>
-                <div style=${n ? { fontSize: 13, color: C.muted, gridColumn: "1 / -1", gridRow: "2" } : { fontSize: 14, color: C.muted }}>
-                  ${c.back}
-                </div>
-                <div
-                  style=${n
-                    ? { fontSize: 11, color: C.faint, gridColumn: "1 / -1", gridRow: "3" }
-                    : { fontSize: 11, color: C.faint, textAlign: "right" }}
-                >
-                  ${this.dueLabel(c)}
-                </div>
-                <button
-                  class="danger"
-                  onClick=${() => this.deleteCard(c.id)}
-                  style=${Object.assign(
-                    {
-                      background: "none",
-                      border: "1px solid " + C.line,
-                      borderRadius: 8,
-                      color: C.ghost,
-                      padding: "6px 0",
-                      fontSize: 13,
-                    },
-                    n ? { gridColumn: "2", gridRow: "1" } : {}
-                  )}
-                >
-                  ✕
-                </button>
-              </div>
-            `
+          ${cards.map((c) =>
+            c.id === s.editId ? this.renderCardEditor(c, field, primary) : this.renderCardRow(c)
           )}
         </div>
       </main>
     `;
+  }
+
+  // デッキ画面のカード1行（通常表示）。行そのものを押すと編集に切り替わります。
+  renderCardRow(c) {
+    const n = this.state.narrow;
+    const at = (col, row) => ({ gridColumn: col, gridRow: row });
+    // 縦積みのときは 表 / 裏 / 補足 / 次回 の順。補足が無い行で空の段ができないよう詰めます。
+    const dueRow = n ? (c.hint ? "4" : "3") : "1";
+    return html`
+      <div
+        key=${c.id}
+        class="soft"
+        onClick=${() => this.startEdit(c)}
+        style=${{
+          background: C.surface,
+          border: "1px solid " + C.line,
+          borderRadius: 12,
+          padding: "14px 16px",
+          display: "grid",
+          gridTemplateColumns: n ? "1fr 34px" : "1fr 1fr 96px 34px",
+          gap: 10,
+          alignItems: "center",
+          cursor: "pointer",
+        }}
+      >
+        <div style=${Object.assign({ fontSize: 14, fontWeight: 500 }, at("1", "1"))}>${c.front}</div>
+        <div style=${Object.assign({ fontSize: n ? 13 : 14, color: C.muted }, n ? at("1 / -1", "2") : at("2", "1"))}>
+          ${c.back}
+        </div>
+        <div
+          style=${Object.assign(
+            { fontSize: 11, color: C.faint },
+            n ? at("1 / -1", dueRow) : Object.assign({ textAlign: "right" }, at("3", "1"))
+          )}
+        >
+          ${this.dueLabel(c)}
+        </div>
+        <button
+          class="danger"
+          onClick=${(e) => {
+            e.stopPropagation();
+            this.deleteCard(c.id);
+          }}
+          style=${Object.assign(
+            {
+              background: "none",
+              border: "1px solid " + C.line,
+              borderRadius: 8,
+              color: C.ghost,
+              padding: "6px 0",
+              fontSize: 13,
+            },
+            n ? at("2", "1") : at("4", "1")
+          )}
+        >
+          ✕
+        </button>
+        ${c.hint &&
+        html`<div
+          style=${Object.assign(
+            {
+              fontSize: 12,
+              color: C.faint,
+              lineHeight: 1.7,
+              whiteSpace: "pre-wrap",
+              display: "-webkit-box",
+              WebkitBoxOrient: "vertical",
+              WebkitLineClamp: "2",
+              overflow: "hidden",
+            },
+            at("1 / -1", n ? "3" : "2")
+          )}
+        >
+          ${c.hint}
+        </div>`}
+      </div>
+    `;
+  }
+
+  // 同じ行を入力欄に差し替えたもの。表・裏・補足をその場で直せます。
+  renderCardEditor(c, field, primary) {
+    const s = this.state;
+    const n = s.narrow;
+    const area = Object.assign({}, field, { resize: "vertical", lineHeight: 1.7 });
+    return html`
+      <div
+        key=${c.id}
+        style=${{
+          background: C.surface,
+          border: "1px solid " + C.accentDeep,
+          borderRadius: 12,
+          padding: 16,
+          display: "grid",
+          gap: 10,
+          animation: "kk-rise .18s ease both",
+        }}
+      >
+        <div style=${{ fontSize: 12, color: C.faint }}>カードを編集</div>
+        <div style=${{ display: "grid", gridTemplateColumns: n ? "1fr" : "1fr 1fr", gap: 10 }}>
+          <textarea
+            rows="2"
+            placeholder="表：問題・単語"
+            value=${s.editFront}
+            onInput=${(e) => this.setState({ editFront: e.target.value })}
+            style=${area}
+          ></textarea>
+          <textarea
+            rows="2"
+            placeholder="裏：答え・意味"
+            value=${s.editBack}
+            onInput=${(e) => this.setState({ editBack: e.target.value })}
+            style=${area}
+          ></textarea>
+        </div>
+        <textarea
+          rows="3"
+          placeholder="補足：例文・説明（省略可）"
+          value=${s.editHint}
+          onInput=${(e) => this.setState({ editHint: e.target.value })}
+          style=${area}
+        ></textarea>
+        <div style=${{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button style=${primary} onClick=${() => this.saveEdit()}>保存</button>
+          <button
+            class="soft"
+            style=${{
+              background: C.bg,
+              border: "1px solid " + C.line,
+              color: C.inkSoft,
+              borderRadius: 10,
+              padding: "12px 18px",
+              fontSize: 13,
+            }}
+            onClick=${() => this.setState({ editId: null })}
+          >
+            キャンセル
+          </button>
+          <button
+            class="danger"
+            style=${{
+              marginLeft: "auto",
+              background: "none",
+              border: "1px solid " + C.line,
+              color: C.faint,
+              borderRadius: 10,
+              padding: "12px 16px",
+              fontSize: 13,
+            }}
+            onClick=${() => this.deleteCard(c.id)}
+          >
+            削除
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  startEdit(c) {
+    this.setState({ editId: c.id, editFront: c.front, editBack: c.back, editHint: c.hint || "" });
+  }
+
+  // 編集内容を書き戻します。学習の進み具合（ease / interval / due など）はそのままです。
+  saveEdit() {
+    const s = this.state;
+    const front = (s.editFront || "").trim();
+    const back = (s.editBack || "").trim();
+    if (!front || !back) {
+      this.toast("表と裏の両方を入力してください");
+      return;
+    }
+    const cards = s.cards.map((x) =>
+      x.id === s.editId ? Object.assign({}, x, { front, back, hint: (s.editHint || "").trim() }) : x
+    );
+    this.setState({ cards, editId: null });
+    this.persist({ cards });
+    this.toast("カードを更新しました");
   }
 
   addCard() {
@@ -2113,15 +2287,18 @@ class App extends Component {
       this.toast("表と裏の両方を入力してください");
       return;
     }
-    const cards = s.cards.concat([this.newCard(s.deckId, s.formFront.trim(), s.formBack.trim())]);
-    this.setState({ cards, formFront: "", formBack: "" });
+    const cards = s.cards.concat([
+      this.newCard(s.deckId, s.formFront.trim(), s.formBack.trim(), s.formHint),
+    ]);
+    this.setState({ cards, formFront: "", formBack: "", formHint: "" });
     this.persist({ cards });
     this.toast("カードを追加しました");
   }
 
   deleteCard(id) {
-    const cards = this.state.cards.filter((x) => x.id !== id);
-    this.setState({ cards });
+    const s = this.state;
+    const cards = s.cards.filter((x) => x.id !== id);
+    this.setState({ cards, editId: s.editId === id ? null : s.editId });
     this.persist({ cards });
     this.toast("カードを削除しました");
   }
@@ -2130,7 +2307,7 @@ class App extends Component {
     const s = this.state;
     const decks = s.decks.filter((d) => d.id !== s.deckId);
     const cards = s.cards.filter((c) => c.deckId !== s.deckId);
-    this.setState({ decks, cards, confirmingDelete: false, screen: "home", deckId: null });
+    this.setState({ decks, cards, confirmingDelete: false, screen: "home", deckId: null, editId: null });
     this.persist({ decks, cards });
     this.toast("デッキを削除しました");
   }
@@ -2159,7 +2336,7 @@ class App extends Component {
         </button>
         <h2 style=${h2Style}>カードを一括取り込み</h2>
         <p style=${{ fontSize: 13, color: C.muted, lineHeight: 1.9, margin: "8px 0 22px" }}>
-          1行に1枚。<strong>表</strong> ・ <strong>裏</strong> ・ <strong>ヒント（省略可）</strong> の順に区切って貼り付けてください。
+          1行に1枚。<strong>表</strong> ・ <strong>裏</strong> ・ <strong>補足（省略可）</strong> の順に区切って貼り付けてください。
           スプレッドシートからそのままコピーできます。区切り文字を含む文は <code>"…"</code> で囲みます。
         </p>
 
@@ -2193,7 +2370,7 @@ class App extends Component {
             </button>
             <button
               style=${Object.assign({}, primary, { padding: "10px 18px" })}
-              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false })}
+              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false, editId: null })}
             >
               デッキを見る
             </button>
@@ -2295,7 +2472,7 @@ class App extends Component {
             >
               <div>表</div>
               <div>裏</div>
-              ${!n && html`<div>ヒント</div>`}
+              ${!n && html`<div>補足</div>`}
             </div>
             ${p.keep.slice(0, 20).map(
               (r) => html`
