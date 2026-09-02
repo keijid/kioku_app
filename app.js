@@ -28,6 +28,15 @@ const C = {
   green: "#3E7C6B",
 };
 
+// Supabase SDK の読み込み元。上から順に試し、ちゃんと動くクライアントが作れたものを使います。
+// バージョンを固定しているのは、@2 のまま最新に追随させると CDN 側の変更だけで
+// ある日突然ログインできなくなるためです。最後の1つだけ最新版を保険に残しています。
+const SB_SOURCES = [
+  "https://esm.sh/@supabase/supabase-js@2.45.4",
+  "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm",
+  "https://esm.sh/@supabase/supabase-js@2",
+];
+
 const SQL_SETUP = [
   "create table if not exists kioku_state (",
   "  user_id uuid primary key references auth.users on delete cascade,",
@@ -483,13 +492,42 @@ class App extends Component {
   async loadSb() {
     const c = this.cfg();
     if (!c || !c.url || !c.key) throw new Error("接続情報が未設定です");
-    if (!this._sb) {
-      const m = await import("https://esm.sh/@supabase/supabase-js@2");
-      this._sb = m.createClient(c.url, c.key, {
-        auth: { persistSession: true, storageKey: "kioku.sb.auth" },
-      });
+    if (this._sb) return this._sb;
+
+    const notes = [];
+    for (let i = 0; i < SB_SOURCES.length; i++) {
+      const src = SB_SOURCES[i];
+      const where = new URL(src).hostname;
+      let m = null;
+      try {
+        m = await import(src);
+      } catch (e) {
+        notes.push(where + "：読み込めませんでした");
+        continue;
+      }
+      const create = m.createClient || (m.default && m.default.createClient);
+      if (typeof create !== "function") {
+        notes.push(where + "：createClient が見つかりません");
+        continue;
+      }
+      let client = null;
+      try {
+        client = create(c.url, c.key, {
+          auth: { persistSession: true, storageKey: "kioku.sb.auth" },
+        });
+      } catch (e) {
+        notes.push(where + "：初期化に失敗（" + (e.message || e) + "）");
+        continue;
+      }
+      // CDN 側のビルドが壊れていると auth を持たないクライアントが返ることがあります。
+      if (!client || !client.auth || typeof client.auth.signInWithPassword !== "function") {
+        notes.push(where + "：SDKの形式が想定と違います");
+        continue;
+      }
+      this._sb = client;
+      return client;
     }
-    return this._sb;
+    throw new Error("Supabase SDK を読み込めませんでした。" + notes.join(" / "));
   }
 
   async initSync() {
