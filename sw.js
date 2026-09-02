@@ -1,4 +1,4 @@
-const CACHE = 'kioku-v16';
+const CACHE = 'kioku-v17';
 const ASSETS = [
   './',
   './index.html',
@@ -32,7 +32,9 @@ self.addEventListener('fetch', (e) => {
 
   if (isShell) {
     e.respondWith(
-      fetch(e.request)
+      // GitHub Pages は Cache-Control ヘッダを設定できず、既定で10分ほど HTTP キャッシュが効く。
+      // cache: 'reload' でそれを迂回し、更新をこれまでどおりすぐ拾えるようにする。
+      fetch(e.request.url, { cache: 'reload', credentials: 'same-origin' })
         .then((res) => {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});

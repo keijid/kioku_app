@@ -27,7 +27,7 @@ app.js       アプリ全体（1ファイル）。Preact + htm。
 sw.js        Service Worker。app.js/index.html は network-first、他は cache-first。
 manifest.webmanifest
 icon-*.png
-netlify.toml Netlify設定（publish はリポジトリルート）
+.nojekyll    GitHub Pages に Jekyll 処理をさせないための空ファイル
 ```
 
 `app.js` は上から順に：定数・ユーティリティ → 旧サンプルデータの除去（`stripSample`）→ `class App`（状態・学習ロジック・同期・集計）→ 各 `renderXxx()` メソッド。
@@ -152,7 +152,17 @@ gradeTotals = { again, hard, good, easy }  // 累計（正答率の算出用）
 
 ## デプロイ
 
-main への push で Netlify が自動デプロイ。ビルドコマンドなし、publish はルート。
+main への push で **GitHub Pages** が自動デプロイ（Settings → Pages、Source は
+「Deploy from a branch」＝ `main` / `/ (root)`）。ビルド工程は無しのままです。
+公開URLは `https://keijid.github.io/kioku_app/` で、サブパス配信になります。
+
+`index.html`・`manifest.webmanifest`・`sw.js` の参照はすべて `./` の相対パスです。
+**絶対パス（`/app.js` など）に書き換えないでください。** サブパス配信で壊れます。
+
+GitHub Pages は `Cache-Control` ヘッダを設定できません（Netlify の `netlify.toml` で
+やっていた `no-cache` 指定は移行できないため廃止しました）。代わりに `sw.js` の
+network-first 側で `fetch(url, { cache: 'reload' })` を使い、HTTPキャッシュを迂回して
+更新を拾っています。ここを素の `fetch(e.request)` に戻さないでください。
 
 **変更を出すときのチェックリスト**
 1. `app.js`（必要なら `index.html`）を編集

@@ -25,7 +25,7 @@ app.js                  アプリ全体（Preact + htm、1ファイル）
 sw.js                   Service Worker（オフラインキャッシュ）
 manifest.webmanifest    PWA マニフェスト
 icon-*.png              アプリアイコン
-netlify.toml            Netlify 設定（publish = ルート）
+.nojekyll               GitHub Pages の Jekyll 処理を止める空ファイル
 CLAUDE.md               開発ガイド（設計方針・アルゴリズム・注意点）
 ```
 
@@ -46,9 +46,15 @@ python3 -m http.server 8000
 
 詳しい設計方針・データ構造・学習アルゴリズム・やってはいけないことは [CLAUDE.md](./CLAUDE.md) にまとめてあります。
 
-## デプロイ（Netlify）
+## デプロイ（GitHub Pages）
 
-main への push で自動デプロイされます。Build command は空、Publish directory はリポジトリルート（`netlify.toml` に設定済み）。
+main への push で自動デプロイされます。Settings → Pages の Source は
+「Deploy from a branch」で `main` / `/ (root)`。ビルド工程はありません。
+
+公開URL: `https://keijid.github.io/kioku_app/`
+
+サブパス配信のため、アプリ内の参照はすべて `./` の相対パスにしてあります。
+絶対パスに書き換えると動かなくなります。
 
 ## 同期（任意・Supabase）
 
