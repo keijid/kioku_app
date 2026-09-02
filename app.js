@@ -43,8 +43,8 @@ const SB_SOURCES = [
 // publishable key はブラウザに配られる公開キーで、実際の保護は kioku_state の RLS（SQL_SETUP）が担っています。
 // secret key は絶対に置かないこと。空のままなら、従来どおり画面から保存先を手入力します。
 const DEFAULT_SB = {
-  url: "",
-  key: "",
+  url: "https://iakueghsgrcxcdsqtdxt.supabase.co",
+  key: "sb_publishable_1s3ilko2FhbU2MbDi4KfBg_PMalXS4f",
 };
 
 const SQL_SETUP = [
