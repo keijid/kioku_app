@@ -10,6 +10,8 @@ const html = htm.bind(h);
 const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
+// 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
+const BUILD = "v8";
 
 const C = {
   bg: "#F3EFE6",
@@ -707,6 +709,22 @@ class App extends Component {
     this._sb = null;
     this.setState({ syncUser: null, syncAt: null, sbUrl: "", sbKey: "" });
     this.toast("接続を解除しました");
+  }
+
+  // 端末に古い版が残ったときの逃げ道。キャッシュとService Workerを捨てて読み直します。
+  async forceUpdate() {
+    this.toast("最新版を取得しています…");
+    try {
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+      if (navigator.serviceWorker) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+    } catch (e) {}
+    location.replace(location.pathname + "?u=" + Date.now());
   }
 
   exportJson() {
@@ -2464,6 +2482,27 @@ class App extends Component {
               <input type="file" accept="application/json" onChange=${(e) => this.importJson(e)} style=${{ display: "none" }} />
             </label>
           </div>
+        </div>
+
+        <div
+          style=${{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            flexWrap: "wrap",
+            marginTop: 22,
+            paddingTop: 18,
+            borderTop: "1px solid " + C.lineSoft,
+          }}
+        >
+          <div style=${{ fontSize: 12, color: C.ghost }}>ビルド ${BUILD}</div>
+          <button
+            class="soft"
+            style=${Object.assign({}, secondary, { marginLeft: "auto", padding: "10px 16px", fontSize: 12 })}
+            onClick=${() => this.forceUpdate()}
+          >
+            アプリを最新にする
+          </button>
         </div>
       </main>
     `;
