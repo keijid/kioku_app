@@ -9,6 +9,7 @@ const html = htm.bind(h);
 
 const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
+const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 
 const C = {
   bg: "#F3EFE6",
@@ -48,6 +49,112 @@ function dayKey(t) {
     "-" +
     String(d.getDate()).padStart(2, "0")
   );
+}
+
+// 一意なID。Date.now() だけだと同じミリ秒に複数作ったとき衝突するので連番を足します。
+let uidSeq = 0;
+function uid(prefix) {
+  uidSeq += 1;
+  return prefix + Date.now().toString(36) + uidSeq.toString(36);
+}
+
+// ---------------------------------------------------------------- 一括取り込みのパーサ
+
+function delimName(d) {
+  if (d === "\t") return "タブ";
+  if (d === ",") return "カンマ";
+  if (d === ";") return "セミコロン";
+  return "";
+}
+
+// 貼り付けられたテキストの区切り文字を推測する。タブ → カンマ → セミコロンの順で優先。
+function guessDelim(text) {
+  const lines = text.split(/\r\n|\r|\n/).filter((l) => l.trim()).slice(0, 20);
+  let best = "\t";
+  let bestCount = 0;
+  ["\t", ",", ";"].forEach((d) => {
+    let n = 0;
+    lines.forEach((l) => {
+      n += l.split(d).length - 1;
+    });
+    if (n > bestCount) {
+      bestCount = n;
+      best = d;
+    }
+  });
+  return best;
+}
+
+// CSV/TSV を1レコード＝1行として分解する。"…" で囲めば区切り文字や改行を本文に含められる。
+function splitRecords(text, delim) {
+  const recs = [];
+  let rec = [];
+  let field = "";
+  let inQuote = false;
+  let line = 1;
+  let startLine = 1;
+  const pushRec = () => {
+    rec.push(field);
+    field = "";
+    recs.push({ line: startLine, cells: rec });
+    rec = [];
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuote) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuote = false;
+        }
+      } else {
+        if (ch === "\n") line++;
+        field += ch;
+      }
+      continue;
+    }
+    if (ch === '"' && field === "") {
+      inQuote = true;
+    } else if (ch === delim) {
+      rec.push(field);
+      field = "";
+    } else if (ch === "\r") {
+      // 何もしない（CRLF の CR を捨てる）
+    } else if (ch === "\n") {
+      pushRec();
+      line++;
+      startLine = line;
+    } else {
+      field += ch;
+    }
+  }
+  if (field !== "" || rec.length) pushRec();
+  return recs;
+}
+
+// 表 / 裏 / ヒント の3列に振り分ける。4列目以降（Anki のタグなど）は捨てます。
+function parseBulk(text, delimKey) {
+  const delim = delimKey === "auto" ? guessDelim(text) : delimKey;
+  const rows = [];
+  const errors = [];
+  if (text.trim()) {
+    splitRecords(text, delim).forEach((r) => {
+      const cells = r.cells.map((c) => c.trim());
+      if (cells.every((c) => !c)) return; // 空行
+      if (cells.length < 2) {
+        errors.push({ line: r.line, text: cells[0], reason: "区切りが見つかりません" });
+        return;
+      }
+      if (!cells[0] || !cells[1]) {
+        errors.push({ line: r.line, text: cells.join(" / "), reason: "表または裏が空です" });
+        return;
+      }
+      rows.push({ line: r.line, front: cells[0], back: cells[1], hint: cells[2] || "" });
+    });
+  }
+  return { delim, rows, errors };
 }
 
 // 初回起動時のサンプルデッキ。実データが入ったら二度と使われません。
@@ -100,7 +207,7 @@ function seedLog() {
 
 class App extends Component {
   state = {
-    screen: "home", // home | study | done | deck | stats | sync
+    screen: "home", // home | study | done | deck | stats | sync | import
     decks: [],
     cards: [],
     deckId: null,
@@ -122,6 +229,14 @@ class App extends Component {
     formBack: "",
     confirmingDelete: false,
     toast: null,
+    // 一括取り込み
+    impFrom: "home",
+    impText: "",
+    impDelim: "auto",
+    impDeck: "",
+    impNewDeckName: "",
+    impSkipDup: true,
+    lastImport: null, // { ids, deckId, deckName, deckCreated }
     // 同期
     sbUrl: "",
     sbKey: "",
@@ -184,7 +299,9 @@ class App extends Component {
           gradeTotals: s.gradeTotals,
         })
       );
-    } catch (e) {}
+    } catch (e) {
+      this.toast("端末に保存できませんでした（空き容量が足りません）");
+    }
     this.queuePush();
   }
 
@@ -735,6 +852,7 @@ class App extends Component {
         ${s.screen === "study" && this.renderStudy()}
         ${s.screen === "done" && this.renderDone()}
         ${s.screen === "deck" && this.renderDeck(box, field, primary, backLink, h2Style)}
+        ${s.screen === "import" && this.renderImport(box, field, primary, secondary, backLink, h2Style)}
         ${s.screen === "stats" && this.renderStats(st, box, backLink, h2Style)}
         ${s.screen === "sync" && this.renderSync(box, field, primary, secondary, backLink, h2Style)}
         ${s.toast &&
@@ -957,6 +1075,20 @@ class App extends Component {
             >
               ＋ デッキを追加
             </button>
+            <button
+              class="ghost"
+              style=${{
+                background: "none",
+                border: "1px dashed #C0B8A5",
+                color: C.muted,
+                borderRadius: 999,
+                padding: "7px 16px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.openImport(null, "home")}
+            >
+              一括で取り込む
+            </button>
           </div>
         </div>
 
@@ -1132,7 +1264,7 @@ class App extends Component {
       this.toast("デッキ名を入力してください");
       return;
     }
-    const decks = this.state.decks.concat([{ id: "d" + Date.now(), name, sub: "自作デッキ" }]);
+    const decks = this.state.decks.concat([{ id: uid("d"), name, sub: "自作デッキ" }]);
     this.setState({ decks, newDeckName: "", newDeckOpen: false });
     this.persist({ decks });
     this.toast("デッキを作成しました");
@@ -1140,7 +1272,7 @@ class App extends Component {
 
   newCard(deckId, front, back) {
     return {
-      id: "c" + Date.now(),
+      id: uid("c"),
       deckId,
       front,
       back,
@@ -1171,6 +1303,109 @@ class App extends Component {
     this.persist({ cards });
     const dn = s.decks.find((d) => d.id === did);
     this.toast("「" + (dn ? dn.name : "") + "」に追加しました");
+  }
+
+  // ---- 一括取り込み ----
+
+  openImport(deckId, from) {
+    const s = this.state;
+    const did = deckId || s.impDeck || (s.decks[0] && s.decks[0].id) || "__new";
+    this.setState({ screen: "import", impFrom: from || "home", impDeck: did, lastImport: null });
+  }
+
+  // 貼り付けテキストを解析して、取り込む行・重複・エラーを数える。描画のたびに呼びます。
+  importPreview() {
+    const s = this.state;
+    const parsed = parseBulk(s.impText, s.impDelim);
+    const existing = new Set(s.cards.filter((c) => c.deckId === s.impDeck).map((c) => c.front.trim()));
+    const seen = new Set();
+    const keep = [];
+    let dup = 0;
+    parsed.rows.forEach((r) => {
+      if (existing.has(r.front) || seen.has(r.front)) {
+        dup++;
+        if (s.impSkipDup) return;
+      }
+      seen.add(r.front);
+      keep.push(r);
+    });
+    return { delim: parsed.delim, rows: parsed.rows, errors: parsed.errors, keep, dup };
+  }
+
+  importFile(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => this.setState({ impText: String(r.result || "") });
+    r.onerror = () => this.toast("ファイルを読み込めませんでした");
+    r.readAsText(f);
+    e.target.value = "";
+  }
+
+  runImport() {
+    const s = this.state;
+    const p = this.importPreview();
+    let decks = s.decks;
+    let deckId = s.impDeck;
+    let deckName = "";
+    let deckCreated = false;
+
+    if (deckId === "__new") {
+      deckName = (s.impNewDeckName || "").trim();
+      if (!deckName) {
+        this.toast("デッキ名を入力してください");
+        return;
+      }
+      deckId = uid("d");
+      deckCreated = true;
+    } else {
+      const d = s.decks.find((x) => x.id === deckId);
+      if (!d) {
+        this.toast("取り込み先のデッキを選んでください");
+        return;
+      }
+      deckName = d.name;
+    }
+    if (!p.keep.length) {
+      this.toast("取り込めるカードがありません");
+      return;
+    }
+    if (deckCreated) decks = decks.concat([{ id: deckId, name: deckName, sub: "取り込んだデッキ" }]);
+
+    const added = p.keep.slice(0, IMPORT_MAX).map((r) => {
+      const c = this.newCard(deckId, r.front, r.back);
+      c.hint = r.hint;
+      return c;
+    });
+    const cards = s.cards.concat(added);
+    const next = {
+      decks,
+      cards,
+      impText: "",
+      impNewDeckName: "",
+      impDeck: deckId,
+      lastImport: { ids: added.map((c) => c.id), deckId, deckName, deckCreated },
+    };
+    this.setState(next);
+    this.persist(next);
+    this.toast(added.length + "枚を取り込みました");
+  }
+
+  undoImport() {
+    const s = this.state;
+    const li = s.lastImport;
+    if (!li) return;
+    const ids = new Set(li.ids);
+    const cards = s.cards.filter((c) => !ids.has(c.id));
+    const decks = li.deckCreated ? s.decks.filter((d) => d.id !== li.deckId) : s.decks;
+    const next = { decks, cards, lastImport: null };
+    if (li.deckCreated) {
+      next.impDeck = (decks[0] && decks[0].id) || "__new";
+      if (s.deckId === li.deckId) next.deckId = null;
+    }
+    this.setState(next);
+    this.persist(next);
+    this.toast("取り込みを取り消しました");
   }
 
   renderStudy() {
@@ -1504,7 +1739,24 @@ class App extends Component {
         </div>`}
 
         <div style=${Object.assign({}, box, { padding: 18, marginBottom: 20 })}>
-          <div style=${{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>カードを追加</div>
+          <div style=${{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+            <div style=${{ fontSize: 13, fontWeight: 700 }}>カードを追加</div>
+            <button
+              class="ghost"
+              style=${{
+                marginLeft: "auto",
+                background: "none",
+                border: "1px dashed #C0B8A5",
+                color: C.muted,
+                borderRadius: 999,
+                padding: "6px 14px",
+                fontSize: 12,
+              }}
+              onClick=${() => this.openImport(s.deckId, "deck")}
+            >
+              一括で取り込む
+            </button>
+          </div>
           <div style=${{ display: "grid", gridTemplateColumns: n ? "1fr" : "1fr 1fr auto", gap: 10, alignItems: "start" }}>
             <textarea
               rows="2"
@@ -1604,6 +1856,232 @@ class App extends Component {
     this.setState({ decks, cards, confirmingDelete: false, screen: "home", deckId: null });
     this.persist({ decks, cards });
     this.toast("デッキを削除しました");
+  }
+
+  renderImport(box, field, primary, secondary, backLink, h2Style) {
+    const s = this.state;
+    const n = s.narrow;
+    const p = this.importPreview();
+    const li = s.lastImport;
+    const isNew = s.impDeck === "__new";
+    const take = Math.min(p.keep.length, IMPORT_MAX);
+    const over = p.keep.length > IMPORT_MAX;
+
+    const label = { fontSize: 12, color: C.faint, marginBottom: 7 };
+    const sel = Object.assign({}, field, { width: "100%", color: C.ink, boxSizing: "border-box" });
+    const cols = n ? "1fr 1fr" : "1fr 1fr 150px";
+    const cell = { fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
+
+    return html`
+      <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        <button
+          style=${backLink}
+          onClick=${() => this.setState({ screen: s.impFrom === "deck" && s.deckId ? "deck" : "home" })}
+        >
+          ${s.impFrom === "deck" && s.deckId ? "← デッキ" : "← デッキ一覧"}
+        </button>
+        <h2 style=${h2Style}>カードを一括取り込み</h2>
+        <p style=${{ fontSize: 13, color: C.muted, lineHeight: 1.9, margin: "8px 0 22px" }}>
+          1行に1枚。<strong>表</strong> ・ <strong>裏</strong> ・ <strong>ヒント（省略可）</strong> の順に区切って貼り付けてください。
+          スプレッドシートからそのままコピーできます。区切り文字を含む文は <code>"…"</code> で囲みます。
+        </p>
+
+        ${li &&
+        html`<div
+          style=${{
+            background: C.surface,
+            border: "1px solid " + C.line,
+            borderLeft: "3px solid " + C.green,
+            borderRadius: 14,
+            padding: "15px 18px",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 14,
+            flexWrap: "wrap",
+            animation: "kk-rise .2s ease both",
+          }}
+        >
+          <div style=${{ fontSize: 13, color: C.inkSoft, lineHeight: 1.6 }}>
+            「${li.deckName}」に <strong>${li.ids.length}</strong> 枚を取り込みました。
+          </div>
+          <div style=${{ display: "flex", gap: 8 }}>
+            <button
+              class="soft"
+              style=${Object.assign({}, secondary, { padding: "10px 16px" })}
+              onClick=${() => this.undoImport()}
+            >
+              取り消す
+            </button>
+            <button
+              style=${Object.assign({}, primary, { padding: "10px 18px" })}
+              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false })}
+            >
+              デッキを見る
+            </button>
+          </div>
+        </div>`}
+
+        <div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ display: "grid", gridTemplateColumns: n ? "1fr" : "1fr 1fr", gap: 16 }}>
+            <div>
+              <div style=${label}>取り込み先のデッキ</div>
+              <select style=${sel} value=${s.impDeck} onChange=${(e) => this.setState({ impDeck: e.target.value })}>
+                ${s.decks.map((d) => html`<option key=${d.id} value=${d.id}>${d.name}</option>`)}
+                <option value="__new">＋ 新しいデッキを作る</option>
+              </select>
+              ${isNew &&
+              html`<input
+                placeholder="デッキ名（例：英検準1級 単語）"
+                value=${s.impNewDeckName}
+                onInput=${(e) => this.setState({ impNewDeckName: e.target.value })}
+                style=${Object.assign({}, sel, { marginTop: 8 })}
+              />`}
+            </div>
+            <div>
+              <div style=${label}>区切り文字</div>
+              <select style=${sel} value=${s.impDelim} onChange=${(e) => this.setState({ impDelim: e.target.value })}>
+                <option value="auto">
+                  自動判定${s.impText.trim() ? "（" + delimName(p.delim) + "）" : ""}
+                </option>
+                <option value=${"\t"}>タブ</option>
+                <option value=",">カンマ</option>
+                <option value=";">セミコロン</option>
+              </select>
+            </div>
+          </div>
+
+          <textarea
+            rows=${n ? 8 : 10}
+            placeholder=${"abundant\t豊富な\tan abundant supply of water\ncomply\t（規則に）従う"}
+            value=${s.impText}
+            onInput=${(e) => this.setState({ impText: e.target.value })}
+            style=${Object.assign({}, field, {
+              width: "100%",
+              marginTop: 16,
+              resize: "vertical",
+              lineHeight: 1.7,
+              boxSizing: "border-box",
+            })}
+          ></textarea>
+
+          <div style=${{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+            <label class="soft" style=${Object.assign({}, secondary, { cursor: "pointer" })}>
+              ファイルから読み込む
+              <input
+                type="file"
+                accept=".csv,.tsv,.txt,text/plain,text/csv"
+                onChange=${(e) => this.importFile(e)}
+                style=${{ display: "none" }}
+              />
+            </label>
+            ${!!s.impText &&
+            html`<button class="soft" style=${secondary} onClick=${() => this.setState({ impText: "" })}>クリア</button>`}
+            <label style=${{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: C.muted, marginLeft: "auto" }}>
+              <input
+                type="checkbox"
+                checked=${s.impSkipDup}
+                onChange=${(e) => this.setState({ impSkipDup: e.target.checked })}
+              />
+              同じ表のカードは取り込まない
+            </label>
+          </div>
+        </div>
+
+        ${!!s.impText.trim() &&
+        html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+            <div style=${{ fontSize: 13, fontWeight: 700 }}>取り込む ${p.keep.length} 枚</div>
+            <div style=${{ fontSize: 12, color: C.faint }}>
+              重複 ${p.dup} 件 ・ エラー ${p.errors.length} 件
+            </div>
+          </div>
+
+          ${over &&
+          html`<div style=${{ fontSize: 12, color: C.red, lineHeight: 1.7, marginBottom: 12 }}>
+            一度に取り込めるのは ${IMPORT_MAX} 枚までです。先頭 ${IMPORT_MAX} 枚だけを取り込みます。
+          </div>`}
+
+          ${!!p.keep.length &&
+          html`<div style=${{ border: "1px solid " + C.lineSoft, borderRadius: 12, overflow: "hidden" }}>
+            <div
+              style=${{
+                display: "grid",
+                gridTemplateColumns: cols,
+                gap: 12,
+                padding: "9px 14px",
+                background: C.field,
+                fontSize: 11,
+                color: C.faint,
+              }}
+            >
+              <div>表</div>
+              <div>裏</div>
+              ${!n && html`<div>ヒント</div>`}
+            </div>
+            ${p.keep.slice(0, 20).map(
+              (r) => html`
+                <div
+                  key=${r.line}
+                  style=${{
+                    display: "grid",
+                    gridTemplateColumns: cols,
+                    gap: 12,
+                    padding: "10px 14px",
+                    borderTop: "1px solid " + C.lineSoft,
+                  }}
+                >
+                  <div style=${Object.assign({}, cell, { fontWeight: 500 })}>${r.front}</div>
+                  <div style=${Object.assign({}, cell, { color: C.muted })}>${r.back}</div>
+                  ${!n && html`<div style=${Object.assign({}, cell, { color: C.ghost, fontSize: 12 })}>${r.hint}</div>`}
+                </div>
+              `
+            )}
+            ${p.keep.length > 20 &&
+            html`<div
+              style=${{
+                padding: "9px 14px",
+                borderTop: "1px solid " + C.lineSoft,
+                fontSize: 12,
+                color: C.ghost,
+              }}
+            >
+              ほか ${p.keep.length - 20} 枚
+            </div>`}
+          </div>`}
+
+          ${!!p.errors.length &&
+          html`<div style=${{ marginTop: 14 }}>
+            <div style=${{ fontSize: 12, color: C.red, marginBottom: 8 }}>
+              次の行は取り込めません。区切り文字を確認してください。
+            </div>
+            <div style=${{ display: "grid", gap: 5 }}>
+              ${p.errors.slice(0, 10).map(
+                (er) => html`
+                  <div key=${er.line} style=${{ fontSize: 12, color: C.faint, lineHeight: 1.6 }}>
+                    ${er.line} 行目：${er.reason}
+                    <span style=${{ color: C.ghost }}> ${(er.text || "").slice(0, 40)}</span>
+                  </div>
+                `
+              )}
+              ${p.errors.length > 10 &&
+              html`<div style=${{ fontSize: 12, color: C.ghost }}>ほか ${p.errors.length - 10} 行</div>`}
+            </div>
+          </div>`}
+        </div>`}
+
+        <div style=${{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <button
+            style=${Object.assign({}, primary, take ? {} : { opacity: 0.4 })}
+            disabled=${!take}
+            onClick=${() => this.runImport()}
+          >
+            ${take ? take + "枚を取り込む" : "取り込む"}
+          </button>
+        </div>
+      </main>
+    `;
   }
 
   renderStats(st, box, backLink, h2Style) {
