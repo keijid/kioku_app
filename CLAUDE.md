@@ -51,6 +51,12 @@ icon-*.png
   こちらが入れた値が黙って別のものに置き換わります。実際に `this._sb`（Supabase クライアント）が
   これで壊れ、同期のログインができなくなりました。用途がわかる長めの名前（`_sbClient` など）にし、
   使い回す前に中身を確認するようにしてください。
+- **メソッド名も同じです。Preact の `Component` が持つ名前を使わないでください**
+  （`setState` `forceUpdate` `render` `componentDidMount` などのライフサイクル一式）。
+  実際に「アプリを最新にする」の実体が `forceUpdate()` という名前になっていて、Preact の
+  `Component.prototype.forceUpdate` を上書きしていました。Preact 側から呼ばれると
+  キャッシュ削除とページ再読み込みが走るため、リロードループになりかねない状態でした
+  （現在は `hardReload()` に改名済み）。
 
 ## 状態とデータ
 
