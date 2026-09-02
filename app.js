@@ -1,0 +1,1957 @@
+// キオク — 間隔反復学習アプリ
+// ビルド工程なし。ブラウザが直接このファイルを ES モジュールとして読み込みます。
+import { h, Component, render } from "https://esm.sh/preact@10.22.0";
+import htm from "https://esm.sh/htm@3.1.1";
+
+const html = htm.bind(h);
+
+// ---------------------------------------------------------------- 定数・ユーティリティ
+
+const DAY = 86400000;
+const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
+
+const C = {
+  bg: "#F3EFE6",
+  surface: "#FFFDF8",
+  ink: "#1C2230",
+  inkSoft: "#4A4540",
+  muted: "#6B655A",
+  faint: "#8A8478",
+  ghost: "#A8A296",
+  line: "#E3DCCB",
+  lineSoft: "#EDE7DA",
+  field: "#F8F5EE",
+  accent: "#F0A868",
+  accentDeep: "#C4844B",
+  red: "#B8452C",
+  green: "#3E7C6B",
+};
+
+const SQL_SETUP = [
+  "create table if not exists kioku_state (",
+  "  user_id uuid primary key references auth.users on delete cascade,",
+  "  data jsonb not null,",
+  "  updated_at timestamptz not null default now()",
+  ");",
+  "alter table kioku_state enable row level security;",
+  'drop policy if exists "own rows" on kioku_state;',
+  'create policy "own rows" on kioku_state',
+  "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);",
+].join("\n");
+
+function dayKey(t) {
+  const d = new Date(t);
+  return (
+    d.getFullYear() +
+    "-" +
+    String(d.getMonth() + 1).padStart(2, "0") +
+    "-" +
+    String(d.getDate()).padStart(2, "0")
+  );
+}
+
+// 初回起動時のサンプルデッキ。実データが入ったら二度と使われません。
+function seed() {
+  const decks = [
+    { id: "d1", name: "TOEIC 頻出単語", sub: "英語 / 語彙" },
+    { id: "d2", name: "日本史 近現代", sub: "社会 / 一問一答" },
+    { id: "d3", name: "Web開発の用語", sub: "IT / 概念" },
+  ];
+  const raw = [
+    ["d1", "abundant", "豊富な、たくさんある", "an abundant supply of water"],
+    ["d1", "comply", "（規則に）従う", "comply with the regulations"],
+    ["d1", "tentative", "暫定的な、仮の", "a tentative schedule"],
+    ["d1", "redundant", "余剰の、冗長な", "redundant staff"],
+    ["d1", "prompt", "迅速な / 促す", "prompt reply"],
+    ["d1", "vacancy", "空室、欠員", "fill a vacancy"],
+    ["d2", "大政奉還が行われた年は？", "1867年（慶応3年）", "徳川慶喜が朝廷へ政権を返上"],
+    ["d2", "廃藩置県が実施された年は？", "1871年（明治4年）", "藩を廃し府県を置いた"],
+    ["d2", "日英同盟が結ばれた年は？", "1902年（明治35年）", "ロシアの南下に対抗"],
+    ["d2", "治安維持法の制定年は？", "1925年（大正14年）", "普通選挙法と同年"],
+    ["d3", "べき等性（idempotency）とは？", "同じ操作を何回行っても結果が変わらない性質", "PUT や DELETE が代表例"],
+    ["d3", "CORS とは？", "ブラウザが異なるオリジンへのアクセスを制御する仕組み", "Cross-Origin Resource Sharing"],
+    ["d3", "デバウンスとは？", "連続イベントの最後だけを実行する制御", "入力補完などで使う"],
+    ["d3", "N+1問題とは？", "1件ずつ追加クエリが飛び、クエリ数が膨らむ問題", "JOIN や事前ロードで解決"],
+  ];
+  const now = Date.now();
+  const cards = raw.map((r, i) => ({
+    id: "c" + i,
+    deckId: r[0],
+    front: r[1],
+    back: r[2],
+    hint: r[3] || "",
+    ease: 2.5,
+    interval: 0,
+    reps: 0,
+    state: i % 4 === 0 ? "review" : "new",
+    due: i % 4 === 0 ? now - DAY : now,
+  }));
+  return { decks, cards };
+}
+
+function seedLog() {
+  const log = {};
+  const pat = [0, 12, 24, 18, 0, 31, 22, 9, 0, 0, 26, 14, 20, 35, 11, 0, 28, 19, 23, 7, 0, 16, 30, 21, 13, 0, 25, 17];
+  for (let i = 27; i >= 1; i--) log[dayKey(Date.now() - i * DAY)] = pat[i % pat.length];
+  return log;
+}
+
+// ---------------------------------------------------------------- アプリ本体
+
+class App extends Component {
+  state = {
+    screen: "home", // home | study | done | deck | stats | sync
+    decks: [],
+    cards: [],
+    deckId: null,
+    queue: [],
+    showAnswer: false,
+    history: [],
+    tally: { again: 0, hard: 0, good: 0, easy: 0 },
+    todayCount: 0,
+    log: {},
+    gradeTotals: { again: 0, hard: 0, good: 0, easy: 0 },
+    narrow: false,
+    newDeckOpen: false,
+    newDeckName: "",
+    quickOpen: false,
+    quickDeck: "",
+    qFront: "",
+    qBack: "",
+    formFront: "",
+    formBack: "",
+    confirmingDelete: false,
+    toast: null,
+    // 同期
+    sbUrl: "",
+    sbKey: "",
+    syncEmail: "",
+    syncPw: "",
+    syncUser: null,
+    syncBusy: false,
+    syncError: null,
+    syncAt: null,
+  };
+
+  componentDidMount() {
+    let data = null;
+    try {
+      data = JSON.parse(localStorage.getItem("kioku.mvp.v1") || "null");
+    } catch (e) {}
+    if (!data || !data.cards || !data.cards.length) data = seed();
+    const log = data.log || seedLog();
+    this.setState({
+      decks: data.decks,
+      cards: data.cards,
+      log: log,
+      gradeTotals: data.gradeTotals || { again: 84, hard: 96, good: 288, easy: 61 },
+      todayCount: log[dayKey(Date.now())] || 0,
+    });
+
+    this._key = (e) => this.onKey(e);
+    window.addEventListener("keydown", this._key);
+    this._rz = () => {
+      const n = window.innerWidth < 620;
+      if (n !== this.state.narrow) this.setState({ narrow: n });
+    };
+    this._rz();
+    window.addEventListener("resize", this._rz);
+
+    const c = this.cfg();
+    if (c) this.setState({ sbUrl: c.url, sbKey: c.key, syncAt: localStorage.getItem("kioku.sync.at") });
+    this.initSync();
+  }
+
+  componentWillUnmount() {
+    window.removeEventListener("keydown", this._key);
+    window.removeEventListener("resize", this._rz);
+    clearTimeout(this._toastT);
+    clearTimeout(this._pushT);
+  }
+
+  // ---- 保存 ----
+
+  persist(extra) {
+    const s = Object.assign({}, this.state, extra || {});
+    try {
+      localStorage.setItem(
+        "kioku.mvp.v1",
+        JSON.stringify({
+          decks: s.decks,
+          cards: s.cards,
+          todayCount: s.todayCount,
+          log: s.log,
+          gradeTotals: s.gradeTotals,
+        })
+      );
+    } catch (e) {}
+    this.queuePush();
+  }
+
+  toast(msg) {
+    clearTimeout(this._toastT);
+    this.setState({ toast: msg });
+    this._toastT = setTimeout(() => this.setState({ toast: null }), 2200);
+  }
+
+  // ---- 学習ロジック（SM-2 簡易版） ----
+
+  dueCards(deckId) {
+    const now = Date.now();
+    return this.state.cards.filter((c) => (!deckId || c.deckId === deckId) && c.due <= now);
+  }
+
+  startStudy(deckId) {
+    const q = this.dueCards(deckId)
+      .sort((a, b) => (a.state === "new" ? 1 : 0) - (b.state === "new" ? 1 : 0))
+      .map((c) => c.id);
+    if (!q.length) {
+      this.toast("このデッキは今日の分が終わっています");
+      return;
+    }
+    this.setState({
+      screen: "study",
+      deckId: deckId,
+      queue: q,
+      showAnswer: false,
+      history: [],
+      tally: { again: 0, hard: 0, good: 0, easy: 0 },
+    });
+  }
+
+  flip() {
+    this.setState({ showAnswer: true });
+  }
+
+  // 評価に応じて次回出題日を決める。ここが暗記アプリの心臓部。
+  schedule(card, grade) {
+    const c = Object.assign({}, card);
+    const now = Date.now();
+    c.reps += 1;
+    if (grade === "again") {
+      c.ease = Math.max(1.3, c.ease - 0.2);
+      c.interval = 0;
+      c.state = "learning";
+      c.due = now; // 同一セッション内で再出題
+    } else if (grade === "hard") {
+      c.ease = Math.max(1.3, c.ease - 0.15);
+      c.interval = c.interval ? Math.max(1, Math.round(c.interval * 1.2)) : 1;
+      c.state = "review";
+      c.due = now + c.interval * DAY;
+    } else if (grade === "good") {
+      c.interval = c.interval ? Math.round(c.interval * c.ease) : c.state === "new" ? 1 : 2;
+      c.state = "review";
+      c.due = now + c.interval * DAY;
+    } else {
+      c.ease = Math.min(3.2, c.ease + 0.15);
+      c.interval = c.interval ? Math.round(c.interval * c.ease * 1.3) : 4;
+      c.state = "review";
+      c.due = now + c.interval * DAY;
+    }
+    return c;
+  }
+
+  rate(grade) {
+    const id = this.state.queue[0];
+    if (!id) return;
+    const card = this.state.cards.find((c) => c.id === id);
+    const updated = this.schedule(card, grade);
+    const cards = this.state.cards.map((c) => (c.id === id ? updated : c));
+    const queue = this.state.queue.slice(1);
+    if (grade === "again") queue.push(id);
+    const tally = Object.assign({}, this.state.tally);
+    tally[grade] += 1;
+    const history = this.state.history.concat([
+      { card: card, queue: this.state.queue, tally: this.state.tally },
+    ]);
+    const k = dayKey(Date.now());
+    const log = Object.assign({}, this.state.log);
+    log[k] = (log[k] || 0) + 1;
+    const gradeTotals = Object.assign({}, this.state.gradeTotals);
+    gradeTotals[grade] = (gradeTotals[grade] || 0) + 1;
+    const next = {
+      cards,
+      queue,
+      tally,
+      history,
+      log,
+      gradeTotals,
+      todayCount: this.state.todayCount + 1,
+      showAnswer: false,
+      screen: queue.length ? "study" : "done",
+    };
+    this.setState(next);
+    this.persist(next);
+  }
+
+  undo() {
+    const h2 = this.state.history.slice();
+    const last = h2.pop();
+    if (!last) return;
+    const cards = this.state.cards.map((c) => (c.id === last.card.id ? last.card : c));
+    const k = dayKey(Date.now());
+    const log = Object.assign({}, this.state.log);
+    log[k] = Math.max(0, (log[k] || 0) - 1);
+    const next = {
+      cards,
+      queue: last.queue,
+      tally: last.tally,
+      history: h2,
+      log,
+      todayCount: Math.max(0, this.state.todayCount - 1),
+      showAnswer: true,
+      screen: "study",
+    };
+    this.setState(next);
+    this.persist(next);
+  }
+
+  bury() {
+    const id = this.state.queue[0];
+    const queue = this.state.queue.slice(1);
+    const cards = this.state.cards.map((c) =>
+      c.id === id ? Object.assign({}, c, { due: Date.now() + DAY }) : c
+    );
+    const next = { cards, queue, showAnswer: false, screen: queue.length ? "study" : "done" };
+    this.setState(next);
+    this.persist(next);
+    this.toast("明日また出題します");
+  }
+
+  onKey(e) {
+    if (this.state.screen !== "study") return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea") return;
+    if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      if (!this.state.showAnswer) this.flip();
+      else this.rate("good");
+      return;
+    }
+    if (!this.state.showAnswer) return;
+    const map = { 1: "again", 2: "hard", 3: "good", 4: "easy" };
+    if (map[e.key]) {
+      e.preventDefault();
+      this.rate(map[e.key]);
+    }
+  }
+
+  intervalLabel(card, grade) {
+    if (!card) return "";
+    if (grade === "again") return "10分後";
+    const d = this.schedule(card, grade).interval;
+    if (d < 1) return "10分後";
+    if (d === 1) return "1日後";
+    if (d < 30) return d + "日後";
+    return Math.round(d / 30) + "か月後";
+  }
+
+  dueLabel(card) {
+    const diff = card.due - Date.now();
+    if (diff <= 0) return card.state === "new" ? "未学習" : "復習待ち";
+    const d = Math.ceil(diff / DAY);
+    return d === 1 ? "明日" : d + "日後";
+  }
+
+  // ---- クラウド同期（Supabase・任意） ----
+
+  cfg() {
+    try {
+      return JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async loadSb() {
+    const c = this.cfg();
+    if (!c || !c.url || !c.key) throw new Error("接続情報が未設定です");
+    if (!this._sb) {
+      const m = await import("https://esm.sh/@supabase/supabase-js@2");
+      this._sb = m.createClient(c.url, c.key, {
+        auth: { persistSession: true, storageKey: "kioku.sb.auth" },
+      });
+    }
+    return this._sb;
+  }
+
+  async initSync() {
+    if (!this.cfg()) return;
+    try {
+      const sb = await this.loadSb();
+      const { data } = await sb.auth.getSession();
+      const user = data && data.session ? data.session.user : null;
+      this.setState({ syncUser: user ? user.email : null });
+      if (!this._authSub) {
+        this._authSub = sb.auth.onAuthStateChange((evt, session) => {
+          const u = session ? session.user.email : null;
+          if (u !== this.state.syncUser) {
+            this.setState({ syncUser: u });
+            if (u) this.pull(true);
+          }
+        });
+      }
+      if (user) this.pull(true);
+    } catch (e) {
+      this.setState({ syncError: String(e.message || e) });
+    }
+  }
+
+  async signIn(mode) {
+    const email = (this.state.syncEmail || "").trim();
+    const pw = this.state.syncPw || "";
+    if (!email || pw.length < 6) {
+      this.toast("メールと6文字以上のパスワードを入力してください");
+      return;
+    }
+    this.setState({ syncBusy: true, syncError: null });
+    try {
+      const sb = await this.loadSb();
+      const res =
+        mode === "up"
+          ? await sb.auth.signUp({ email, password: pw })
+          : await sb.auth.signInWithPassword({ email, password: pw });
+      if (res.error) throw res.error;
+      const data = res.data || {};
+      if (!data.session) {
+        this.setState({
+          syncBusy: false,
+          syncPw: "",
+          syncError:
+            "登録は受け付けられましたが、まだログインできていません。" +
+            email +
+            " に届いた確認メールのリンクを開いたうえで「ログイン」を押してください。（確認メールを不要にするには Supabase の Authentication → Sign In / Providers → Email で Confirm email を OFF にします）",
+        });
+        return;
+      }
+      this.setState({ syncUser: data.session.user.email, syncPw: "", syncBusy: false, syncError: null });
+      this.toast("ログインしました");
+      this.pull(true);
+    } catch (e) {
+      this.setState({ syncBusy: false, syncError: String(e.message || e) });
+    }
+  }
+
+  async signOut() {
+    try {
+      const sb = await this.loadSb();
+      await sb.auth.signOut();
+    } catch (e) {}
+    this.setState({ syncUser: null, syncAt: null });
+    this.toast("ログアウトしました");
+  }
+
+  payload() {
+    const s = this.state;
+    return { decks: s.decks, cards: s.cards, log: s.log, gradeTotals: s.gradeTotals, todayCount: s.todayCount };
+  }
+
+  async push() {
+    if (!this.state.syncUser) return;
+    this.setState({ syncBusy: true, syncError: null });
+    try {
+      const sb = await this.loadSb();
+      const { data: u } = await sb.auth.getUser();
+      const at = new Date().toISOString();
+      const { error } = await sb
+        .from("kioku_state")
+        .upsert({ user_id: u.user.id, data: this.payload(), updated_at: at });
+      if (error) throw error;
+      localStorage.setItem("kioku.sync.at", at);
+      this.setState({ syncBusy: false, syncAt: at });
+    } catch (e) {
+      this.setState({ syncBusy: false, syncError: String(e.message || e) });
+    }
+  }
+
+  // 競合は updated_at が新しい方を採用（last-write-wins）
+  async pull(silent) {
+    if (!this.state.syncUser) return;
+    this.setState({ syncBusy: true, syncError: null });
+    try {
+      const sb = await this.loadSb();
+      const { data: u } = await sb.auth.getUser();
+      const { data, error } = await sb
+        .from("kioku_state")
+        .select("data, updated_at")
+        .eq("user_id", u.user.id)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) {
+        this.setState({ syncBusy: false });
+        await this.push();
+        return;
+      }
+      const localAt = localStorage.getItem("kioku.sync.at");
+      const remoteNewer = !localAt || new Date(data.updated_at) > new Date(localAt);
+      if (remoteNewer && data.data) {
+        const d = data.data;
+        const next = {
+          decks: d.decks || [],
+          cards: d.cards || [],
+          log: d.log || {},
+          gradeTotals: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
+          todayCount: (d.log && d.log[dayKey(Date.now())]) || 0,
+        };
+        this.setState(Object.assign({}, next, { syncBusy: false, syncAt: data.updated_at }));
+        localStorage.setItem("kioku.sync.at", data.updated_at);
+        this.persist(next);
+        if (!silent) this.toast("クラウドから復元しました");
+      } else {
+        this.setState({ syncBusy: false });
+        await this.push();
+        if (!silent) this.toast("この端末のデータをアップロードしました");
+      }
+    } catch (e) {
+      this.setState({ syncBusy: false, syncError: String(e.message || e) });
+    }
+  }
+
+  queuePush() {
+    if (!this.state.syncUser) return;
+    clearTimeout(this._pushT);
+    this._pushT = setTimeout(() => this.push(), 2500);
+  }
+
+  saveCfg() {
+    const url = (this.state.sbUrl || "").trim();
+    const key = (this.state.sbKey || "").trim();
+    let origin = "";
+    try {
+      origin = new URL(url).origin;
+    } catch (e) {}
+    if (!origin) {
+      this.toast("URLは https:// から始まる Project URL を入力してください");
+      return;
+    }
+    if (/supabase\.com$/.test(new URL(origin).hostname)) {
+      this.setState({
+        syncError:
+          "これはダッシュボードのURLです。Project Settings → Data API にある Project URL（https://〇〇〇.supabase.co）を貼ってください。",
+      });
+      return;
+    }
+    if (key.length < 20) {
+      this.toast("キーが短すぎます。Publishable key 全体を貼り付けてください");
+      return;
+    }
+    if (/^sb_secret_/.test(key)) {
+      this.toast("Secret key は使えません。Publishable key を貼ってください");
+      return;
+    }
+    localStorage.setItem("kioku.sync.cfg", JSON.stringify({ url: origin, key }));
+    this._sb = null;
+    this.setState({ sbUrl: origin, syncError: null });
+    this.toast("接続情報を保存しました");
+    this.initSync();
+  }
+
+  clearCfg() {
+    localStorage.removeItem("kioku.sync.cfg");
+    localStorage.removeItem("kioku.sync.at");
+    this._sb = null;
+    this.setState({ syncUser: null, syncAt: null, sbUrl: "", sbKey: "" });
+    this.toast("接続を解除しました");
+  }
+
+  exportJson() {
+    const blob = new Blob([JSON.stringify(this.payload(), null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "kioku-backup-" + dayKey(Date.now()) + ".json";
+    a.click();
+    this.toast("バックアップを書き出しました");
+  }
+
+  importJson(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const d = JSON.parse(r.result);
+        const next = {
+          decks: d.decks || [],
+          cards: d.cards || [],
+          log: d.log || {},
+          gradeTotals: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
+          todayCount: (d.log && d.log[dayKey(Date.now())]) || 0,
+        };
+        this.setState(next);
+        this.persist(next);
+        this.toast("バックアップを読み込みました");
+      } catch (err) {
+        this.toast("ファイルを読み込めませんでした");
+      }
+    };
+    r.readAsText(f);
+  }
+
+  // ---- 集計（学習の記録画面で使う） ----
+
+  stats() {
+    const s = this.state;
+    const now = Date.now();
+    const log = s.log || {};
+    const cards = s.cards;
+
+    let streak = 0;
+    for (let i = 0; i < 400; i++) {
+      const v = log[dayKey(now - i * DAY)] || 0;
+      if (v > 0) streak++;
+      else if (i > 0) break;
+    }
+
+    const heatColor = (v) =>
+      v === 0 ? "#E7E0D2" : v < 8 ? "#DCE9E1" : v < 16 ? "#A9CDBD" : v < 26 ? "#6BA893" : "#3E7C6B";
+    const heatCells = [];
+    const days = 91;
+    const start = now - (days - 1) * DAY;
+    const startDow = new Date(start).getDay();
+    for (let i = 0; i < startDow; i++) heatCells.push({ key: "pad" + i, color: "transparent", label: "", today: false });
+    for (let i = 0; i < days; i++) {
+      const k = dayKey(start + i * DAY);
+      const v = log[k] || 0;
+      heatCells.push({ key: k, color: heatColor(v), label: k + "：" + v + "枚", today: k === dayKey(now) });
+    }
+    const heatLegend = [0, 5, 12, 20, 30].map((v) => ({ key: "l" + v, color: heatColor(v) }));
+
+    let weekTotal = 0;
+    let monthTotal = 0;
+    for (let i = 0; i < 30; i++) {
+      const v = log[dayKey(now - i * DAY)] || 0;
+      monthTotal += v;
+      if (i < 7) weekTotal += v;
+    }
+
+    const gt = s.gradeTotals || {};
+    const gAll = (gt.again || 0) + (gt.hard || 0) + (gt.good || 0) + (gt.easy || 0);
+    const retention = gAll ? Math.round(((gAll - (gt.again || 0)) / gAll) * 100) : 0;
+
+    const m = { fresh: 0, learning: 0, young: 0, mature: 0 };
+    cards.forEach((c) => {
+      if (c.state === "new") m.fresh++;
+      else if (c.interval < 1) m.learning++;
+      else if (c.interval < 21) m.young++;
+      else m.mature++;
+    });
+    const maturity = [
+      ["未学習", m.fresh, "#D8D1C1"],
+      ["学習中", m.learning, "#EBC98A"],
+      ["定着中", m.young, "#A9CDBD"],
+      ["定着済み", m.mature, "#3E7C6B"],
+    ].map((x) => ({
+      name: x[0],
+      count: x[1],
+      color: x[2],
+      pct: cards.length ? Math.round((x[1] / cards.length) * 100) + "%" : "0%",
+      width: cards.length ? (x[1] / cards.length) * 100 + "%" : "0%",
+    }));
+
+    const fc = [];
+    for (let i = 0; i < 7; i++) {
+      const from = i === 0 ? 0 : now + i * DAY - DAY / 2;
+      const to = now + i * DAY + DAY / 2;
+      const n = cards.filter((c) => (i === 0 ? c.due <= now : c.due > from && c.due <= to)).length;
+      fc.push({ i, n, label: i === 0 ? "今日" : i === 1 ? "明日" : "+" + i + "日" });
+    }
+    const fcMax = Math.max.apply(null, fc.map((f) => f.n).concat([1]));
+    const forecast = fc.map((f) => ({
+      key: "f" + f.i,
+      label: f.label,
+      n: f.n,
+      height: Math.max(4, Math.round((f.n / fcMax) * 92)),
+      color: f.i === 0 ? C.accent : "#C9D9D1",
+    }));
+
+    const deckProgress = s.decks.map((d, i) => {
+      const cs = cards.filter((c) => c.deckId === d.id);
+      const mature = cs.filter((c) => c.interval >= 21).length;
+      const pct = cs.length ? Math.round((mature / cs.length) * 100) : 0;
+      return { key: d.id, name: d.name, total: cs.length, mature, pct: pct + "%", color: ACCENTS[i % ACCENTS.length] };
+    });
+
+    return {
+      streak,
+      heatCells,
+      heatLegend,
+      weekTotal,
+      weekAvg: Math.round(weekTotal / 7),
+      monthTotal,
+      retention,
+      maturity,
+      maturityTotal: cards.length,
+      forecast,
+      deckProgress,
+    };
+  }
+
+  // ---------------------------------------------------------------- 描画
+
+  render() {
+    const s = this.state;
+    const n = s.narrow;
+    const st = this.stats();
+    const box = { background: C.surface, border: "1px solid " + C.line, borderRadius: 18, padding: 20 };
+    const field = {
+      border: "1px solid " + C.line,
+      background: C.field,
+      borderRadius: 10,
+      padding: "12px 14px",
+      fontSize: 14,
+      outline: "none",
+    };
+    const primary = {
+      background: C.ink,
+      color: C.bg,
+      border: "none",
+      borderRadius: 10,
+      padding: "12px 22px",
+      fontSize: 14,
+      fontWeight: 700,
+    };
+    const secondary = {
+      background: C.bg,
+      border: "1px solid " + C.line,
+      color: C.inkSoft,
+      borderRadius: 10,
+      padding: "12px 18px",
+      fontSize: 13,
+    };
+    const backLink = {
+      background: "none",
+      border: "none",
+      color: C.faint,
+      fontSize: 13,
+      padding: "6px 0",
+      marginBottom: 10,
+    };
+    const h2Style = { margin: 0, fontSize: n ? 22 : 28, fontWeight: 700 };
+
+    return html`
+      <div style=${{ minHeight: "100vh", background: C.bg, padding: "0 20px 80px" }}>
+        ${this.renderHeader(st)}
+        ${s.screen === "home" && this.renderHome(st, box, field, primary)}
+        ${s.screen === "study" && this.renderStudy()}
+        ${s.screen === "done" && this.renderDone()}
+        ${s.screen === "deck" && this.renderDeck(box, field, primary, backLink, h2Style)}
+        ${s.screen === "stats" && this.renderStats(st, box, backLink, h2Style)}
+        ${s.screen === "sync" && this.renderSync(box, field, primary, secondary, backLink, h2Style)}
+        ${s.toast &&
+        html`<div
+          style=${{
+            position: "fixed",
+            left: "50%",
+            bottom: "calc(28px + env(safe-area-inset-bottom))",
+            transform: "translateX(-50%)",
+            background: C.ink,
+            color: C.bg,
+            padding: "12px 22px",
+            borderRadius: 999,
+            fontSize: 13,
+            boxShadow: "0 10px 30px rgba(28,34,48,.25)",
+            animation: "kk-rise .2s ease both",
+            zIndex: 50,
+          }}
+        >
+          ${s.toast}
+        </div>`}
+      </div>
+    `;
+  }
+
+  renderHeader(st) {
+    const s = this.state;
+    const n = s.narrow;
+    const pill = {
+      display: "flex",
+      alignItems: "baseline",
+      gap: 5,
+      background: C.surface,
+      border: "1px solid " + C.line,
+      borderRadius: 999,
+      padding: n ? "6px 12px" : "8px 16px",
+      whiteSpace: "nowrap",
+      flexShrink: 0,
+    };
+    const navBtn = {
+      background: "none",
+      border: "1px solid " + C.line,
+      color: C.muted,
+      borderRadius: 999,
+      padding: n ? "6px 13px" : "8px 15px",
+      fontSize: 13,
+      whiteSpace: "nowrap",
+    };
+    return html`
+      <header
+        style=${{
+          maxWidth: 900,
+          margin: "0 auto",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          padding: n ? "18px 0 14px" : "26px 0 18px",
+          flexWrap: "wrap",
+        }}
+      >
+        <div
+          style=${{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer", flexShrink: 0 }}
+          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false })}
+        >
+          <div
+            style=${{
+              width: 34,
+              height: 34,
+              borderRadius: 10,
+              background: C.ink,
+              color: C.bg,
+              display: "grid",
+              placeItems: "center",
+              fontFamily: "'Zen Old Mincho', serif",
+              fontSize: 19,
+              fontWeight: 700,
+            }}
+          >
+            記
+          </div>
+          <div>
+            <div style=${{ fontSize: 17, fontWeight: 700, letterSpacing: ".04em" }}>キオク</div>
+            <div style=${{ fontSize: 11, color: C.faint, letterSpacing: ".14em" }}>SPACED REPETITION</div>
+          </div>
+        </div>
+        <div style=${{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, flexWrap: "wrap" }}>
+          <button class="ghost" style=${navBtn} onClick=${() => this.setState({ screen: "stats" })}>記録</button>
+          <button class="ghost" style=${navBtn} onClick=${() => this.setState({ screen: "sync", syncError: null })}>
+            同期
+          </button>
+          <div style=${{ width: 1, height: 20, background: C.line }}></div>
+          <div style=${pill} onClick=${() => this.setState({ screen: "stats" })}>
+            <span style=${{ fontSize: 12, color: C.faint }}>連続</span>
+            <span style=${{ fontSize: 15, fontWeight: 700 }}>${st.streak}</span>
+            <span style=${{ fontSize: 12, color: C.faint }}>日</span>
+          </div>
+          <div style=${pill}>
+            <span style=${{ fontSize: 12, color: C.faint }}>今日</span>
+            <span style=${{ fontSize: 15, fontWeight: 700 }}>${this.state.todayCount}</span>
+            <span style=${{ fontSize: 12, color: C.faint }}>枚</span>
+          </div>
+        </div>
+      </header>
+    `;
+  }
+
+  renderHome(st, box, field, primary) {
+    const s = this.state;
+    const n = s.narrow;
+    const now = Date.now();
+    const totalDue = this.dueCards(null).length;
+
+    const decks = s.decks.map((d, i) => {
+      const cs = s.cards.filter((c) => c.deckId === d.id);
+      const dueCount = cs.filter((c) => c.due <= now && c.state !== "new").length;
+      const newCount = cs.filter((c) => c.due <= now && c.state === "new").length;
+      const mature = cs.filter((c) => c.interval >= 2).length;
+      return {
+        d,
+        cs,
+        dueCount,
+        newCount,
+        empty: dueCount + newCount === 0,
+        barWidth: cs.length ? Math.round((mature / cs.length) * 100) + "%" : "0%",
+        color: ACCENTS[i % ACCENTS.length],
+      };
+    });
+
+    return html`
+      <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        <section
+          style=${{
+            background: C.ink,
+            borderRadius: 22,
+            padding: n ? "26px 22px" : "34px 36px",
+            color: C.bg,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 24,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style=${{ maxWidth: 460 }}>
+            <div style=${{ fontSize: 12, letterSpacing: ".18em", color: C.ghost }}>TODAY</div>
+            <h1 style=${{ margin: "8px 0 10px", fontSize: n ? 25 : 34, lineHeight: 1.3, fontWeight: 700, textWrap: "pretty" }}>
+              復習が待っているカードが<br />
+              <span style=${{ fontFamily: "'Zen Old Mincho', serif", fontSize: n ? 34 : 44, color: C.accent }}>
+                ${totalDue}
+              </span>
+              枚あります
+            </h1>
+            <p style=${{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#BDB7AB" }}>
+              1日10分で十分。忘れかけたタイミングで出題されるので、少ない回数で長く覚えられます。
+            </p>
+          </div>
+          <button
+            class="cta"
+            style=${{
+              background: C.accent,
+              color: C.ink,
+              border: "none",
+              borderRadius: 14,
+              padding: n ? "16px 22px" : "18px 30px",
+              fontSize: n ? 15 : 17,
+              fontWeight: 700,
+              boxShadow: "0 8px 0 " + C.accentDeep,
+              width: n ? "100%" : "auto",
+            }}
+            onClick=${() => this.startStudy(null)}
+          >
+            今日の学習をはじめる →
+          </button>
+        </section>
+
+        <div
+          style=${{
+            display: "flex",
+            alignItems: n ? "flex-start" : "baseline",
+            flexDirection: n ? "column" : "row",
+            justifyContent: "space-between",
+            gap: n ? 10 : 16,
+            margin: "34px 0 14px",
+          }}
+        >
+          <h2 style=${{ margin: 0, fontSize: 18, fontWeight: 700, flexShrink: 0, whiteSpace: "nowrap" }}>デッキ</h2>
+          <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              class="dark"
+              style=${{
+                background: C.ink,
+                border: "1px solid " + C.ink,
+                color: C.bg,
+                borderRadius: 999,
+                padding: "8px 16px",
+                fontSize: 13,
+                fontWeight: 700,
+              }}
+              onClick=${() =>
+                this.setState({
+                  quickOpen: !s.quickOpen,
+                  newDeckOpen: false,
+                  quickDeck: s.quickDeck || (s.decks[0] && s.decks[0].id) || "",
+                })}
+            >
+              ＋ カードを追加
+            </button>
+            <button
+              class="ghost"
+              style=${{
+                background: "none",
+                border: "1px dashed #C0B8A5",
+                color: C.muted,
+                borderRadius: 999,
+                padding: "7px 16px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.setState({ newDeckOpen: !s.newDeckOpen })}
+            >
+              ＋ デッキを追加
+            </button>
+          </div>
+        </div>
+
+        ${s.quickOpen &&
+        html`<div
+          style=${{
+            background: C.surface,
+            border: "1px solid " + C.line,
+            borderRadius: 16,
+            padding: 18,
+            marginBottom: 14,
+            animation: "kk-rise .2s ease both",
+          }}
+        >
+          <div style=${{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+            <div style=${{ fontSize: 13, fontWeight: 700 }}>カードを追加</div>
+            <select
+              value=${s.quickDeck || (s.decks[0] && s.decks[0].id) || ""}
+              onChange=${(e) => this.setState({ quickDeck: e.target.value })}
+              style=${{
+                border: "1px solid " + C.line,
+                background: C.field,
+                borderRadius: 8,
+                padding: "7px 10px",
+                fontSize: 13,
+                color: C.ink,
+                outline: "none",
+              }}
+            >
+              ${s.decks.map((d) => html`<option key=${d.id} value=${d.id}>${d.name}</option>`)}
+            </select>
+            <button
+              style=${{ marginLeft: "auto", background: "none", border: "none", color: C.ghost, fontSize: 13 }}
+              onClick=${() => this.setState({ quickOpen: false })}
+            >
+              閉じる
+            </button>
+          </div>
+          <div style=${{ display: "grid", gridTemplateColumns: n ? "1fr" : "1fr 1fr auto", gap: 10, alignItems: "start" }}>
+            <textarea
+              rows="2"
+              placeholder="表：問題・単語"
+              value=${s.qFront}
+              onInput=${(e) => this.setState({ qFront: e.target.value })}
+              style=${Object.assign({}, field, { resize: "vertical" })}
+            ></textarea>
+            <textarea
+              rows="2"
+              placeholder="裏：答え・意味"
+              value=${s.qBack}
+              onInput=${(e) => this.setState({ qBack: e.target.value })}
+              style=${Object.assign({}, field, { resize: "vertical" })}
+            ></textarea>
+            <button style=${Object.assign({}, primary, { height: "100%" })} onClick=${() => this.quickAdd()}>追加</button>
+          </div>
+          <div style=${{ fontSize: 11, color: C.ghost, marginTop: 8 }}>続けて入力すれば何枚でも追加できます。</div>
+        </div>`}
+
+        ${s.newDeckOpen &&
+        html`<div
+          style=${{
+            background: C.surface,
+            border: "1px solid " + C.line,
+            borderRadius: 16,
+            padding: 16,
+            marginBottom: 14,
+            display: "flex",
+            gap: 10,
+          }}
+        >
+          <input
+            placeholder="デッキ名（例：フランス語 基礎1000）"
+            value=${s.newDeckName}
+            onInput=${(e) => this.setState({ newDeckName: e.target.value })}
+            style=${Object.assign({}, field, { flex: 1 })}
+          />
+          <button style=${primary} onClick=${() => this.createDeck()}>作成</button>
+        </div>`}
+
+        <div style=${{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(272px, 1fr))", gap: 16 }}>
+          ${decks.map(
+            (x) => html`
+              <div
+                key=${x.d.id}
+                class="lift"
+                style=${{
+                  background: C.surface,
+                  border: "1px solid " + C.line,
+                  borderRadius: 18,
+                  padding: 20,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 14,
+                }}
+              >
+                <div style=${{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+                  <div>
+                    <div style=${{ fontSize: 16, fontWeight: 700, lineHeight: 1.4 }}>${x.d.name}</div>
+                    <div style=${{ fontSize: 12, color: C.faint, marginTop: 3 }}>${x.d.sub}</div>
+                  </div>
+                  <div
+                    style=${{
+                      width: 30,
+                      height: 30,
+                      borderRadius: 9,
+                      display: "grid",
+                      placeItems: "center",
+                      fontSize: 13,
+                      fontWeight: 700,
+                      fontFamily: "'Zen Old Mincho', serif",
+                      background: C.bg,
+                      color: C.muted,
+                    }}
+                  >
+                    ${x.d.name.slice(0, 1)}
+                  </div>
+                </div>
+
+                <div style=${{ height: 6, background: C.lineSoft, borderRadius: 99, overflow: "hidden" }}>
+                  <div style=${{ height: "100%", width: x.barWidth, background: x.color, borderRadius: 99, transition: "width .4s ease" }}></div>
+                </div>
+
+                <div style=${{ display: "flex", gap: 14, fontSize: 12, color: C.muted }}>
+                  <span>復習 <strong style=${{ fontSize: 14, color: C.red }}>${x.dueCount}</strong></span>
+                  <span>新規 <strong style=${{ fontSize: 14, color: C.green }}>${x.newCount}</strong></span>
+                  <span style=${{ marginLeft: "auto", color: C.ghost }}>${x.cs.length} 枚</span>
+                </div>
+
+                <div style=${{ display: "flex", gap: 8, marginTop: 2 }}>
+                  <button
+                    disabled=${x.empty}
+                    onClick=${() => this.startStudy(x.d.id)}
+                    style=${{
+                      flex: 1,
+                      border: "none",
+                      borderRadius: 10,
+                      padding: "11px 14px",
+                      fontSize: 13,
+                      fontWeight: 700,
+                      background: x.empty ? C.lineSoft : C.ink,
+                      color: x.empty ? C.ghost : C.bg,
+                      cursor: x.empty ? "default" : "pointer",
+                    }}
+                  >
+                    ${x.empty ? "完了 ✓" : "学習する（" + (x.dueCount + x.newCount) + "）"}
+                  </button>
+                  <button
+                    class="soft"
+                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false })}
+                    style=${{
+                      background: C.bg,
+                      border: "1px solid " + C.line,
+                      color: C.inkSoft,
+                      borderRadius: 10,
+                      padding: "11px 14px",
+                      fontSize: 13,
+                    }}
+                  >
+                    カード
+                  </button>
+                </div>
+              </div>
+            `
+          )}
+        </div>
+      </main>
+    `;
+  }
+
+  createDeck() {
+    const name = (this.state.newDeckName || "").trim();
+    if (!name) {
+      this.toast("デッキ名を入力してください");
+      return;
+    }
+    const decks = this.state.decks.concat([{ id: "d" + Date.now(), name, sub: "自作デッキ" }]);
+    this.setState({ decks, newDeckName: "", newDeckOpen: false });
+    this.persist({ decks });
+    this.toast("デッキを作成しました");
+  }
+
+  newCard(deckId, front, back) {
+    return {
+      id: "c" + Date.now(),
+      deckId,
+      front,
+      back,
+      hint: "",
+      ease: 2.5,
+      interval: 0,
+      reps: 0,
+      state: "new",
+      due: Date.now(),
+    };
+  }
+
+  quickAdd() {
+    const s = this.state;
+    const f = (s.qFront || "").trim();
+    const b = (s.qBack || "").trim();
+    const did = s.quickDeck || (s.decks[0] && s.decks[0].id);
+    if (!did) {
+      this.toast("先にデッキを作成してください");
+      return;
+    }
+    if (!f || !b) {
+      this.toast("表と裏の両方を入力してください");
+      return;
+    }
+    const cards = s.cards.concat([this.newCard(did, f, b)]);
+    this.setState({ cards, qFront: "", qBack: "" });
+    this.persist({ cards });
+    const dn = s.decks.find((d) => d.id === did);
+    this.toast("「" + (dn ? dn.name : "") + "」に追加しました");
+  }
+
+  renderStudy() {
+    const s = this.state;
+    const n = s.narrow;
+    const card = s.cards.find((c) => c.id === s.queue[0]);
+    const deck = s.decks.find((d) => d.id === s.deckId);
+    const done = s.history.length;
+    const pct = Math.round((done / Math.max(done + s.queue.length, 1)) * 100);
+    const stateLabels = { new: "新しいカード", learning: "学習中", review: "復習" };
+
+    const grades = [
+      ["again", "もう一度", "1", "#FBEDE9", "#EFCFC5", C.red, "#A87A6C", "#C4A79C"],
+      ["hard", "むずかしい", "2", "#FBF4E7", "#EBDCBE", "#96702A", "#A08A5E", "#C0AE87"],
+      ["good", "できた", "3", "#ECF3EF", "#C9DDD3", "#2F6B59", "#6A8B7F", "#9BB4AA"],
+      ["easy", "かんたん", "4", "#ECEFF7", "#CBD3E6", "#3B4C86", "#6F7CA3", "#A3ACC6"],
+    ];
+
+    return html`
+      <main style=${{ maxWidth: 760, margin: "0 auto" }}>
+        <div style=${{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}>
+          <button
+            style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "6px 0" }}
+            onClick=${() => this.setState({ screen: "home", showAnswer: false })}
+          >
+            ← 中断する
+          </button>
+          <div style=${{ flex: 1, height: 8, background: "#E7E0D2", borderRadius: 99, overflow: "hidden" }}>
+            <div style=${{ height: "100%", width: pct + "%", background: C.accent, borderRadius: 99, transition: "width .3s ease" }}></div>
+          </div>
+          <div style=${{ fontSize: 13, color: C.muted, fontVariantNumeric: "tabular-nums" }}>残り ${s.queue.length} 枚</div>
+        </div>
+
+        <div
+          key=${s.queue[0] || "none"}
+          style=${{
+            background: C.surface,
+            border: "1px solid " + C.line,
+            borderRadius: 24,
+            boxShadow: "0 14px 40px rgba(28,34,48,.07)",
+            overflow: "hidden",
+            animation: "kk-pop .22s ease both",
+          }}
+        >
+          <div
+            style=${{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "14px 22px",
+              borderBottom: "1px solid " + C.lineSoft,
+              fontSize: 12,
+              color: C.faint,
+            }}
+          >
+            <span>${deck ? deck.name : "すべてのデッキ"}</span>
+            <span style=${{ background: C.bg, borderRadius: 99, padding: "4px 12px", color: C.muted }}>
+              ${card ? stateLabels[card.state] || "復習" : ""}
+            </span>
+          </div>
+
+          <div
+            style=${{
+              minHeight: n ? 160 : 210,
+              display: "grid",
+              placeItems: "center",
+              padding: n ? "30px 20px" : "46px 32px",
+              textAlign: "center",
+            }}
+          >
+            <div>
+              <div style=${{ fontSize: n ? 24 : 32, fontWeight: 700, lineHeight: 1.45, textWrap: "pretty" }}>
+                ${card ? card.front : ""}
+              </div>
+              ${s.showAnswer &&
+              html`<div
+                style=${{
+                  marginTop: 26,
+                  paddingTop: 26,
+                  borderTop: "1px dashed #DDD5C4",
+                  animation: "kk-rise .2s ease both",
+                }}
+              >
+                <div style=${{ fontSize: n ? 19 : 24, lineHeight: 1.6, color: "#2E3648", textWrap: "pretty" }}>
+                  ${card ? card.back : ""}
+                </div>
+                <div style=${{ marginTop: 10, fontSize: 13, color: C.faint }}>${card ? card.hint : ""}</div>
+              </div>`}
+            </div>
+          </div>
+
+          ${!s.showAnswer &&
+          html`<div
+            style=${{
+              padding: "20px 22px 26px",
+              borderTop: "1px solid " + C.lineSoft,
+              display: "grid",
+              gap: 10,
+              justifyItems: "center",
+            }}
+          >
+            <button
+              class="dark"
+              style=${{
+                width: "100%",
+                background: C.ink,
+                color: C.bg,
+                border: "none",
+                borderRadius: 14,
+                padding: 18,
+                fontSize: 16,
+                fontWeight: 700,
+              }}
+              onClick=${() => this.flip()}
+            >
+              答えを見る
+            </button>
+            <div style=${{ fontSize: 12, color: C.ghost }}>スペースキーでもめくれます</div>
+          </div>`}
+
+          ${s.showAnswer &&
+          html`<div style=${{ padding: "18px 22px 24px", borderTop: "1px solid " + C.lineSoft }}>
+            <div style=${{ fontSize: 12, color: C.faint, textAlign: "center", marginBottom: 12 }}>
+              どのくらい思い出せましたか？
+            </div>
+            <div style=${{ display: "grid", gridTemplateColumns: n ? "1fr 1fr" : "repeat(4, 1fr)", gap: 10 }}>
+              ${grades.map(
+                (g) => html`
+                  <button
+                    key=${g[0]}
+                    class="grade"
+                    onClick=${() => this.rate(g[0])}
+                    style=${{
+                      background: g[3],
+                      border: "1px solid " + g[4],
+                      borderRadius: 14,
+                      padding: "14px 8px",
+                      display: "grid",
+                      gap: 3,
+                      justifyItems: "center",
+                    }}
+                  >
+                    <span style=${{ fontSize: 15, fontWeight: 700, color: g[5] }}>${g[1]}</span>
+                    <span style=${{ fontSize: 11, color: g[6] }}>${this.intervalLabel(card, g[0])}</span>
+                    <span style=${{ fontSize: 10, color: g[7] }}>${g[2]}</span>
+                  </button>
+                `
+              )}
+            </div>
+          </div>`}
+        </div>
+
+        <div style=${{ display: "flex", justifyContent: "center", gap: 18, marginTop: 18, fontSize: 13 }}>
+          <button
+            disabled=${!s.history.length}
+            onClick=${() => this.undo()}
+            style=${{
+              background: "none",
+              border: "none",
+              padding: 6,
+              color: s.history.length ? C.muted : "#C9C2B4",
+              cursor: s.history.length ? "pointer" : "default",
+            }}
+          >
+            ↺ ひとつ戻す
+          </button>
+          <button style=${{ background: "none", border: "none", color: C.faint, padding: 6 }} onClick=${() => this.bury()}>
+            今日はスキップ
+          </button>
+        </div>
+      </main>
+    `;
+  }
+
+  renderDone() {
+    const t = this.state.tally;
+    const done = this.state.history.length;
+    const cells = [
+      [t.again, "もう一度", "#FBEDE9", C.red, "#A87A6C"],
+      [t.hard, "むずかしい", "#FBF4E7", "#96702A", "#A08A5E"],
+      [t.good, "できた", "#ECF3EF", "#2F6B59", "#6A8B7F"],
+      [t.easy, "かんたん", "#ECEFF7", "#3B4C86", "#6F7CA3"],
+    ];
+    return html`
+      <main style=${{ maxWidth: 620, margin: "40px auto 0", textAlign: "center", animation: "kk-pop .3s ease both" }}>
+        <div style=${{ background: C.surface, border: "1px solid " + C.line, borderRadius: 24, padding: "46px 34px" }}>
+          <div style=${{ fontFamily: "'Zen Old Mincho', serif", fontSize: 46, color: C.green }}>完</div>
+          <h2 style=${{ margin: "10px 0 6px", fontSize: 26 }}>今日のぶんは終わりました</h2>
+          <p style=${{ margin: "0 0 26px", fontSize: 14, color: C.muted, lineHeight: 1.7 }}>
+            ${done} 枚を復習しました。
+            ${t.again ? "「もう一度」だったカードは明日また出題されます。" : "順調です。この調子で続けましょう。"}
+          </p>
+          <div style=${{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 28 }}>
+            ${cells.map(
+              (c) => html`
+                <div key=${c[1]} style=${{ background: c[2], borderRadius: 14, padding: "14px 6px" }}>
+                  <div style=${{ fontSize: 22, fontWeight: 700, color: c[3] }}>${c[0]}</div>
+                  <div style=${{ fontSize: 11, color: c[4] }}>${c[1]}</div>
+                </div>
+              `
+            )}
+          </div>
+          <button
+            class="dark"
+            style=${{
+              background: C.ink,
+              color: C.bg,
+              border: "none",
+              borderRadius: 14,
+              padding: "15px 30px",
+              fontSize: 15,
+              fontWeight: 700,
+            }}
+            onClick=${() => this.setState({ screen: "home" })}
+          >
+            デッキ一覧へ戻る
+          </button>
+        </div>
+      </main>
+    `;
+  }
+
+  renderDeck(box, field, primary, backLink, h2Style) {
+    const s = this.state;
+    const n = s.narrow;
+    const deck = s.decks.find((d) => d.id === s.deckId);
+    const cards = s.cards.filter((c) => c.deckId === s.deckId);
+
+    return html`
+      <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false })}>
+          ← デッキ一覧
+        </button>
+        <div
+          style=${{
+            display: "flex",
+            alignItems: "flex-end",
+            justifyContent: "space-between",
+            gap: 20,
+            flexWrap: "wrap",
+            marginBottom: 22,
+          }}
+        >
+          <div>
+            <h2 style=${h2Style}>${deck ? deck.name : ""}</h2>
+            <div style=${{ fontSize: 13, color: C.faint, marginTop: 4 }}>
+              ${cards.length} 枚 ・ ${deck ? deck.sub : ""}
+            </div>
+          </div>
+          <div style=${{ display: "flex", gap: 8, alignItems: "center" }}>
+            ${!s.confirmingDelete &&
+            html`<button
+              class="danger"
+              style=${{
+                background: "none",
+                border: "1px solid " + C.line,
+                color: C.faint,
+                borderRadius: 12,
+                padding: "13px 16px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.setState({ confirmingDelete: true })}
+            >
+              デッキを削除
+            </button>`}
+            <button
+              style=${{
+                background: C.accent,
+                color: C.ink,
+                border: "none",
+                borderRadius: 12,
+                padding: "13px 22px",
+                fontSize: 14,
+                fontWeight: 700,
+              }}
+              onClick=${() => this.startStudy(s.deckId)}
+            >
+              このデッキを学習
+            </button>
+          </div>
+        </div>
+
+        ${s.confirmingDelete &&
+        html`<div
+          style=${{
+            background: "#FBEDE9",
+            border: "1px solid #EFCFC5",
+            borderRadius: 16,
+            padding: "16px 18px",
+            marginBottom: 18,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 14,
+            flexWrap: "wrap",
+            animation: "kk-rise .2s ease both",
+          }}
+        >
+          <div style=${{ fontSize: 13, color: "#8E3320", lineHeight: 1.6 }}>
+            このデッキと <strong>${cards.length}</strong> 枚のカードを削除します。学習履歴も消え、元に戻せません。
+          </div>
+          <div style=${{ display: "flex", gap: 8 }}>
+            <button
+              style=${{
+                background: C.surface,
+                border: "1px solid " + C.line,
+                color: C.inkSoft,
+                borderRadius: 10,
+                padding: "11px 18px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.setState({ confirmingDelete: false })}
+            >
+              キャンセル
+            </button>
+            <button
+              style=${{
+                background: C.red,
+                border: "none",
+                color: "#FFF6F2",
+                borderRadius: 10,
+                padding: "11px 18px",
+                fontSize: 13,
+                fontWeight: 700,
+              }}
+              onClick=${() => this.deleteDeck()}
+            >
+              削除する
+            </button>
+          </div>
+        </div>`}
+
+        <div style=${Object.assign({}, box, { padding: 18, marginBottom: 20 })}>
+          <div style=${{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>カードを追加</div>
+          <div style=${{ display: "grid", gridTemplateColumns: n ? "1fr" : "1fr 1fr auto", gap: 10, alignItems: "start" }}>
+            <textarea
+              rows="2"
+              placeholder="表：問題・単語"
+              value=${s.formFront}
+              onInput=${(e) => this.setState({ formFront: e.target.value })}
+              style=${Object.assign({}, field, { resize: "vertical" })}
+            ></textarea>
+            <textarea
+              rows="2"
+              placeholder="裏：答え・意味"
+              value=${s.formBack}
+              onInput=${(e) => this.setState({ formBack: e.target.value })}
+              style=${Object.assign({}, field, { resize: "vertical" })}
+            ></textarea>
+            <button style=${Object.assign({}, primary, { height: "100%" })} onClick=${() => this.addCard()}>追加</button>
+          </div>
+        </div>
+
+        <div style=${{ display: "grid", gap: 8 }}>
+          ${cards.map(
+            (c) => html`
+              <div
+                key=${c.id}
+                style=${{
+                  background: C.surface,
+                  border: "1px solid " + C.line,
+                  borderRadius: 12,
+                  padding: "14px 16px",
+                  display: "grid",
+                  gridTemplateColumns: n ? "1fr 34px" : "1fr 1fr 96px 34px",
+                  gap: 10,
+                  alignItems: "center",
+                }}
+              >
+                <div style=${n ? { fontSize: 14, fontWeight: 500, gridColumn: "1", gridRow: "1" } : { fontSize: 14, fontWeight: 500 }}>
+                  ${c.front}
+                </div>
+                <div style=${n ? { fontSize: 13, color: C.muted, gridColumn: "1 / -1", gridRow: "2" } : { fontSize: 14, color: C.muted }}>
+                  ${c.back}
+                </div>
+                <div
+                  style=${n
+                    ? { fontSize: 11, color: C.faint, gridColumn: "1 / -1", gridRow: "3" }
+                    : { fontSize: 11, color: C.faint, textAlign: "right" }}
+                >
+                  ${this.dueLabel(c)}
+                </div>
+                <button
+                  class="danger"
+                  onClick=${() => this.deleteCard(c.id)}
+                  style=${Object.assign(
+                    {
+                      background: "none",
+                      border: "1px solid " + C.line,
+                      borderRadius: 8,
+                      color: C.ghost,
+                      padding: "6px 0",
+                      fontSize: 13,
+                    },
+                    n ? { gridColumn: "2", gridRow: "1" } : {}
+                  )}
+                >
+                  ✕
+                </button>
+              </div>
+            `
+          )}
+        </div>
+      </main>
+    `;
+  }
+
+  addCard() {
+    const s = this.state;
+    if (!s.formFront.trim() || !s.formBack.trim()) {
+      this.toast("表と裏の両方を入力してください");
+      return;
+    }
+    const cards = s.cards.concat([this.newCard(s.deckId, s.formFront.trim(), s.formBack.trim())]);
+    this.setState({ cards, formFront: "", formBack: "" });
+    this.persist({ cards });
+    this.toast("カードを追加しました");
+  }
+
+  deleteCard(id) {
+    const cards = this.state.cards.filter((x) => x.id !== id);
+    this.setState({ cards });
+    this.persist({ cards });
+    this.toast("カードを削除しました");
+  }
+
+  deleteDeck() {
+    const s = this.state;
+    const decks = s.decks.filter((d) => d.id !== s.deckId);
+    const cards = s.cards.filter((c) => c.deckId !== s.deckId);
+    this.setState({ decks, cards, confirmingDelete: false, screen: "home", deckId: null });
+    this.persist({ decks, cards });
+    this.toast("デッキを削除しました");
+  }
+
+  renderStats(st, box, backLink, h2Style) {
+    const stat = (label, value, unit, extra) => html`
+      <div style=${Object.assign({}, box, { borderRadius: 16, padding: "18px 20px" })}>
+        <div style=${{ fontSize: 11, color: C.faint, letterSpacing: ".1em" }}>${label}</div>
+        <div style=${{ fontSize: 30, fontWeight: 700, lineHeight: 1.2 }}>
+          ${value}${unit && html`<span style=${{ fontSize: 14, color: C.faint, fontWeight: 400 }}> ${unit}</span>`}
+        </div>
+        ${extra}
+      </div>
+    `;
+
+    return html`
+      <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home" })}>← デッキ一覧</button>
+        <h2 style=${h2Style}>学習の記録</h2>
+        <div style=${{ fontSize: 13, color: C.faint, margin: "4px 0 22px" }}>
+          続けた日数と定着の状況をひと目で確認できます。
+        </div>
+
+        <div style=${{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 18 }}>
+          ${stat("連続学習", st.streak, "日")}
+          ${stat(
+            "今週の枚数",
+            st.weekTotal,
+            "枚",
+            html`<div style=${{ fontSize: 11, color: C.ghost, marginTop: 2 }}>1日平均 ${st.weekAvg} 枚</div>`
+          )}
+          ${stat("30日間", st.monthTotal, "枚")}
+          <div style=${Object.assign({}, box, { borderRadius: 16, padding: "18px 20px" })}>
+            <div style=${{ fontSize: 11, color: C.faint, letterSpacing: ".1em" }}>正答率</div>
+            <div style=${{ fontSize: 30, fontWeight: 700, lineHeight: 1.2, color: "#2F6B59" }}>${st.retention}%</div>
+            <div style=${{ height: 5, background: C.lineSoft, borderRadius: 99, overflow: "hidden", marginTop: 8 }}>
+              <div style=${{ height: "100%", width: st.retention + "%", background: C.green, borderRadius: 99, transition: "width .4s ease" }}></div>
+            </div>
+          </div>
+        </div>
+
+        <div style=${Object.assign({}, box, { marginBottom: 18 })}>
+          <div style=${{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, marginBottom: 14 }}>
+            <div style=${{ fontSize: 14, fontWeight: 700 }}>この3か月の学習</div>
+            <div style=${{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: C.ghost }}>
+              <span>少</span>
+              ${st.heatLegend.map(
+                (l) => html`<div key=${l.key} style=${{ width: 11, height: 11, borderRadius: 3, background: l.color }}></div>`
+              )}
+              <span>多</span>
+            </div>
+          </div>
+          <div
+            style=${{
+              display: "grid",
+              gridTemplateRows: "repeat(7, 14px)",
+              gridAutoFlow: "column",
+              gridAutoColumns: "14px",
+              gap: 4,
+              justifyContent: "start",
+              overflowX: "auto",
+            }}
+          >
+            ${st.heatCells.map(
+              (c) => html`<div
+                key=${c.key}
+                title=${c.label}
+                style=${{
+                  width: 14,
+                  height: 14,
+                  borderRadius: 3,
+                  background: c.color,
+                  outline: c.today ? "1.5px solid " + C.ink : "none",
+                  outlineOffset: 1,
+                }}
+              ></div>`
+            )}
+          </div>
+        </div>
+
+        <div style=${{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 18, marginBottom: 18 }}>
+          <div style=${box}>
+            <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>カードの定着状況</div>
+            <div style=${{ fontSize: 11, color: C.ghost, marginBottom: 14 }}>全 ${st.maturityTotal} 枚</div>
+            <div style=${{ display: "flex", height: 12, borderRadius: 99, overflow: "hidden", background: C.lineSoft, marginBottom: 16 }}>
+              ${st.maturity.map(
+                (m) => html`<div key=${m.name} style=${{ width: m.width, background: m.color, transition: "width .4s ease" }}></div>`
+              )}
+            </div>
+            <div style=${{ display: "grid", gap: 9 }}>
+              ${st.maturity.map(
+                (m) => html`
+                  <div key=${m.name} style=${{ display: "flex", alignItems: "center", gap: 9, fontSize: 13 }}>
+                    <div style=${{ width: 9, height: 9, borderRadius: 99, background: m.color, flexShrink: 0 }}></div>
+                    <span style=${{ color: C.inkSoft }}>${m.name}</span>
+                    <span style=${{ marginLeft: "auto", fontWeight: 700 }}>${m.count}</span>
+                    <span style=${{ color: C.ghost, fontSize: 11, width: 38, textAlign: "right" }}>${m.pct}</span>
+                  </div>
+                `
+              )}
+            </div>
+          </div>
+
+          <div style=${box}>
+            <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>これから出題される枚数</div>
+            <div style=${{ fontSize: 11, color: C.ghost, marginBottom: 16 }}>今日からの7日間</div>
+            <div style=${{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 8, alignItems: "end", height: 120 }}>
+              ${st.forecast.map(
+                (f) => html`
+                  <div
+                    key=${f.key}
+                    style=${{
+                      display: "flex",
+                      flexDirection: "column",
+                      justifyContent: "flex-end",
+                      alignItems: "center",
+                      gap: 6,
+                      height: "100%",
+                    }}
+                  >
+                    <div style=${{ fontSize: 11, color: C.muted, fontWeight: 700 }}>${f.n}</div>
+                    <div style=${{ width: "100%", height: f.height, background: f.color, borderRadius: "5px 5px 0 0", transition: "height .4s ease" }}></div>
+                  </div>
+                `
+              )}
+            </div>
+            <div style=${{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 8, marginTop: 8 }}>
+              ${st.forecast.map(
+                (f) => html`<div key=${f.key} style=${{ fontSize: 10, color: C.ghost, textAlign: "center" }}>${f.label}</div>`
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style=${box}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 16 }}>デッキ別の定着率</div>
+          <div style=${{ display: "grid", gap: 14 }}>
+            ${st.deckProgress.map(
+              (d) => html`
+                <div key=${d.key}>
+                  <div style=${{ display: "flex", alignItems: "baseline", gap: 10, fontSize: 13, marginBottom: 6 }}>
+                    <span style=${{ fontWeight: 500 }}>${d.name}</span>
+                    <span style=${{ marginLeft: "auto", color: C.faint, fontSize: 11 }}>${d.mature} / ${d.total} 枚</span>
+                    <span style=${{ fontWeight: 700, width: 44, textAlign: "right" }}>${d.pct}</span>
+                  </div>
+                  <div style=${{ height: 8, background: C.lineSoft, borderRadius: 99, overflow: "hidden" }}>
+                    <div style=${{ height: "100%", width: d.pct, background: d.color, borderRadius: 99, transition: "width .4s ease" }}></div>
+                  </div>
+                </div>
+              `
+            )}
+          </div>
+        </div>
+      </main>
+    `;
+  }
+
+  renderSync(box, field, primary, secondary, backLink, h2Style) {
+    const s = this.state;
+    const cfg = this.cfg();
+    const status = s.syncBusy
+      ? "同期中…"
+      : s.syncAt
+      ? "最終同期 " +
+        new Date(s.syncAt).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })
+      : "まだ同期していません";
+
+    return html`
+      <main style=${{ maxWidth: 720, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home" })}>← デッキ一覧</button>
+        <div style=${{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <h2 style=${h2Style}>同期とバックアップ</h2>
+          <span
+            style=${{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 11,
+              borderRadius: 999,
+              padding: "5px 12px",
+              background: s.syncUser ? "#ECF3EF" : C.bg,
+              color: s.syncUser ? "#2F6B59" : C.faint,
+            }}
+          >
+            ${s.syncUser ? "同期オン" : cfg ? "未ログイン" : "この端末のみ"}
+          </span>
+        </div>
+        <div style=${{ fontSize: 13, color: C.faint, margin: "6px 0 22px", lineHeight: 1.7 }}>
+          ログインすると、学習履歴とカードが複数の端末で同じ状態になります。設定しない場合はこの端末の中だけに保存されます。
+        </div>
+
+        ${s.syncError &&
+        html`<div
+          style=${{
+            background: "#FBEDE9",
+            border: "1px solid #EFCFC5",
+            color: "#8E3320",
+            borderRadius: 14,
+            padding: "14px 16px",
+            fontSize: 13,
+            lineHeight: 1.6,
+            marginBottom: 16,
+          }}
+        >
+          ${s.syncError}
+        </div>`}
+
+        ${!cfg &&
+        html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>ステップ1：保存先を用意する</div>
+          <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.8, marginBottom: 14 }}>
+            <a href="https://supabase.com" target="_blank" rel="noreferrer">Supabase</a>
+            で無料プロジェクトを作り、SQL Editor に下のSQLを貼って実行します。次に Project Settings → API から
+            <strong>Project URL</strong> と <strong>Publishable key</strong>（sb_publishable_… / 旧 anon key）をコピーしてください。Secret
+            key は使いません。
+          </div>
+          <div
+            style=${{
+              background: C.ink,
+              color: "#D6DCE8",
+              borderRadius: 12,
+              padding: 16,
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+              fontSize: 11.5,
+              lineHeight: 1.75,
+              whiteSpace: "pre-wrap",
+              overflowX: "auto",
+            }}
+          >
+            ${SQL_SETUP}
+          </div>
+          <button
+            class="soft"
+            style=${{
+              marginTop: 10,
+              background: C.bg,
+              border: "1px solid " + C.line,
+              color: C.inkSoft,
+              borderRadius: 10,
+              padding: "9px 16px",
+              fontSize: 12,
+            }}
+            onClick=${() => {
+              if (navigator.clipboard)
+                navigator.clipboard.writeText(SQL_SETUP).then(() => this.toast("SQLをコピーしました"), () => {});
+            }}
+          >
+            SQLをコピー
+          </button>
+        </div>`}
+
+        <div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>ステップ2：接続情報</div>
+          <div style=${{ display: "grid", gap: 10 }}>
+            <input
+              placeholder="https://xxxxx.supabase.co"
+              value=${s.sbUrl}
+              onInput=${(e) => this.setState({ sbUrl: e.target.value })}
+              style=${Object.assign({}, field, { fontSize: 13 })}
+            />
+            <input
+              placeholder="publishable key（sb_publishable_... / 旧 anon key）"
+              value=${s.sbKey}
+              onInput=${(e) => this.setState({ sbKey: e.target.value })}
+              style=${Object.assign({}, field, { fontSize: 13 })}
+            />
+            <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button style=${primary} onClick=${() => this.saveCfg()}>保存して接続</button>
+              ${cfg &&
+              html`<button class="danger" style=${Object.assign({}, secondary, { background: "none", color: C.faint })} onClick=${() => this.clearCfg()}>
+                接続を解除
+              </button>`}
+            </div>
+          </div>
+        </div>
+
+        ${cfg &&
+        html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>ステップ3：ログイン</div>
+          ${!s.syncUser
+            ? html`<div style=${{ display: "grid", gap: 10 }}>
+                <input
+                  type="email"
+                  placeholder="メールアドレス"
+                  value=${s.syncEmail}
+                  onInput=${(e) => this.setState({ syncEmail: e.target.value })}
+                  style=${Object.assign({}, field, { fontSize: 13 })}
+                />
+                <input
+                  type="password"
+                  placeholder="パスワード（6文字以上）"
+                  value=${s.syncPw}
+                  onInput=${(e) => this.setState({ syncPw: e.target.value })}
+                  style=${Object.assign({}, field, { fontSize: 13 })}
+                />
+                <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button disabled=${s.syncBusy} style=${primary} onClick=${() => this.signIn("in")}>ログイン</button>
+                  <button class="soft" disabled=${s.syncBusy} style=${secondary} onClick=${() => this.signIn("up")}>
+                    新規登録
+                  </button>
+                </div>
+                ${s.syncBusy && html`<div style=${{ fontSize: 12, color: C.faint }}>通信中…</div>`}
+              </div>`
+            : html`<div style=${{ display: "grid", gap: 14 }}>
+                <div style=${{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                  <div>
+                    <div style=${{ fontSize: 14, fontWeight: 500 }}>${s.syncUser}</div>
+                    <div style=${{ fontSize: 12, color: C.faint, marginTop: 2 }}>${status}</div>
+                  </div>
+                  <button
+                    class="ghost"
+                    style=${{
+                      background: "none",
+                      border: "1px solid " + C.line,
+                      color: C.faint,
+                      borderRadius: 10,
+                      padding: "10px 16px",
+                      fontSize: 12,
+                    }}
+                    onClick=${() => this.signOut()}
+                  >
+                    ログアウト
+                  </button>
+                </div>
+                <div style=${{ fontSize: 12, color: C.muted, lineHeight: 1.7, background: C.field, borderRadius: 12, padding: "12px 14px" }}>
+                  学習するたび自動でアップロードされます。別の端末では、同じアカウントでログインすれば最新の状態が取り込まれます。
+                </div>
+                <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button style=${primary} onClick=${() => this.pull(false)}>今すぐ同期</button>
+                  <button class="soft" style=${secondary} onClick=${() => this.push()}>この端末の内容で上書き</button>
+                </div>
+              </div>`}
+        </div>`}
+
+        <div style=${box}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>ファイルでバックアップ</div>
+          <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.7, marginBottom: 14 }}>
+            同期を使わない場合の保険。JSONファイルに書き出し、別の端末で読み込めば移行できます。
+          </div>
+          <div style=${{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button class="soft" style=${secondary} onClick=${() => this.exportJson()}>書き出す</button>
+            <label class="soft" style=${Object.assign({}, secondary, { cursor: "pointer" })}>
+              読み込む
+              <input type="file" accept="application/json" onChange=${(e) => this.importJson(e)} style=${{ display: "none" }} />
+            </label>
+          </div>
+        </div>
+      </main>
+    `;
+  }
+}
+
+render(html`<${App} />`, document.getElementById("app"));
