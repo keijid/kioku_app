@@ -30,7 +30,7 @@ icon-*.png
 netlify.toml Netlify設定（publish はリポジトリルート）
 ```
 
-`app.js` は上から順に：定数・ユーティリティ → 初期サンプルデータ → `class App`（状態・学習ロジック・同期・集計）→ 各 `renderXxx()` メソッド。
+`app.js` は上から順に：定数・ユーティリティ → 旧サンプルデータの除去（`stripSample`）→ `class App`（状態・学習ロジック・同期・集計）→ 各 `renderXxx()` メソッド。
 
 ## 技術スタック
 

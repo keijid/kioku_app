@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v11";
+const BUILD = "v12";
 
 const C = {
   bg: "#F3EFE6",
@@ -176,50 +176,29 @@ function parseBulk(text, delimKey) {
   return { delim, rows, errors };
 }
 
-// 初回起動時のサンプルデッキ。実データが入ったら二度と使われません。
-function seed() {
-  const decks = [
-    { id: "d1", name: "TOEIC 頻出単語", sub: "英語 / 語彙" },
-    { id: "d2", name: "日本史 近現代", sub: "社会 / 一問一答" },
-    { id: "d3", name: "Web開発の用語", sub: "IT / 概念" },
-  ];
-  const raw = [
-    ["d1", "abundant", "豊富な、たくさんある", "an abundant supply of water"],
-    ["d1", "comply", "（規則に）従う", "comply with the regulations"],
-    ["d1", "tentative", "暫定的な、仮の", "a tentative schedule"],
-    ["d1", "redundant", "余剰の、冗長な", "redundant staff"],
-    ["d1", "prompt", "迅速な / 促す", "prompt reply"],
-    ["d1", "vacancy", "空室、欠員", "fill a vacancy"],
-    ["d2", "大政奉還が行われた年は？", "1867年（慶応3年）", "徳川慶喜が朝廷へ政権を返上"],
-    ["d2", "廃藩置県が実施された年は？", "1871年（明治4年）", "藩を廃し府県を置いた"],
-    ["d2", "日英同盟が結ばれた年は？", "1902年（明治35年）", "ロシアの南下に対抗"],
-    ["d2", "治安維持法の制定年は？", "1925年（大正14年）", "普通選挙法と同年"],
-    ["d3", "べき等性（idempotency）とは？", "同じ操作を何回行っても結果が変わらない性質", "PUT や DELETE が代表例"],
-    ["d3", "CORS とは？", "ブラウザが異なるオリジンへのアクセスを制御する仕組み", "Cross-Origin Resource Sharing"],
-    ["d3", "デバウンスとは？", "連続イベントの最後だけを実行する制御", "入力補完などで使う"],
-    ["d3", "N+1問題とは？", "1件ずつ追加クエリが飛び、クエリ数が膨らむ問題", "JOIN や事前ロードで解決"],
-  ];
-  const now = Date.now();
-  const cards = raw.map((r, i) => ({
-    id: "c" + i,
-    deckId: r[0],
-    front: r[1],
-    back: r[2],
-    hint: r[3] || "",
-    ease: 2.5,
-    interval: 0,
-    reps: 0,
-    state: i % 4 === 0 ? "review" : "new",
-    due: i % 4 === 0 ? now - DAY : now,
-  }));
-  return { decks, cards };
-}
+// 以前の版が初回起動時に入れていたサンプルデータ。保存済みの端末から取り除くために
+// デッキIDと名前を残してあります（利用者が作ったデッキはIDの形が違うので巻き込みません）。
+const SAMPLE_DECKS = {
+  d1: "TOEIC 頻出単語",
+  d2: "日本史 近現代",
+  d3: "Web開発の用語",
+};
 
-function seedLog() {
-  const log = {};
-  const pat = [0, 12, 24, 18, 0, 31, 22, 9, 0, 0, 26, 14, 20, 35, 11, 0, 28, 19, 23, 7, 0, 16, 30, 21, 13, 0, 25, 17];
-  for (let i = 27; i >= 1; i--) log[dayKey(Date.now() - i * DAY)] = pat[i % pat.length];
-  return log;
+// 保存済みデータからサンプルのデッキ・カードを取り除きます。取り除いた結果カードが
+// 1枚も残らないときは、サンプルと一緒に作られていた学習ログと評価の累計も消します。
+function stripSample(data) {
+  if (!data || !data.decks) return { data, changed: false };
+  const sampleIds = data.decks.filter((d) => SAMPLE_DECKS[d.id] === d.name).map((d) => d.id);
+  if (!sampleIds.length) return { data, changed: false };
+  const decks = data.decks.filter((d) => sampleIds.indexOf(d.id) < 0);
+  const cards = (data.cards || []).filter((c) => sampleIds.indexOf(c.deckId) < 0 || !/^c\d+$/.test(c.id));
+  const next = Object.assign({}, data, { decks, cards });
+  if (!cards.length) {
+    next.log = {};
+    next.gradeTotals = { again: 0, hard: 0, good: 0, easy: 0 };
+    next.todayCount = 0;
+  }
+  return { data: next, changed: true };
 }
 
 // ---------------------------------------------------------------- アプリ本体
@@ -277,18 +256,32 @@ class App extends Component {
     try {
       data = JSON.parse(localStorage.getItem("kioku.mvp.v1") || "null");
     } catch (e) {}
+    // 以前の版が入れたサンプルデータが保存されていれば、ここで取り除きます。
+    const stripped = stripSample(data);
+    data = stripped.data;
+    this._sampleStripped = stripped.changed;
     // この端末に既に学習データがあったか。真ならログイン画面を挟まず今までどおり表示します
     // （ログインを促した結果、手元のデータが見えなくなる事故を防ぐため）。
     this._hadSavedData = !!(data && data.cards && data.cards.length);
-    if (!this._hadSavedData) data = seed();
-    const log = data.log || seedLog();
+    // 初回起動は空の状態から始めます（サンプルデータは入れません）。
+    const log = (data && data.log) || {};
     this.setState({
-      decks: data.decks,
-      cards: data.cards,
+      decks: (data && data.decks) || [],
+      cards: (data && data.cards) || [],
       log: log,
-      gradeTotals: data.gradeTotals || { again: 84, hard: 96, good: 288, easy: 61 },
+      gradeTotals: (data && data.gradeTotals) || { again: 0, hard: 0, good: 0, easy: 0 },
       todayCount: log[dayKey(Date.now())] || 0,
     });
+    if (this._sampleStripped) {
+      this.persist({
+        decks: data.decks,
+        cards: data.cards,
+        log: log,
+        gradeTotals: data.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
+        todayCount: log[dayKey(Date.now())] || 0,
+      });
+      this.toast("サンプルデータを削除しました");
+    }
 
     this._key = (e) => this.onKey(e);
     window.addEventListener("keydown", this._key);
@@ -358,7 +351,7 @@ class App extends Component {
       .sort((a, b) => (a.state === "new" ? 1 : 0) - (b.state === "new" ? 1 : 0))
       .map((c) => c.id);
     if (!q.length) {
-      this.toast("このデッキは今日の分が終わっています");
+      this.toast(this.state.cards.length ? "このデッキは今日の分が終わっています" : "まずはカードを追加してください");
       return;
     }
     this.setState({
@@ -766,7 +759,8 @@ class App extends Component {
       const localAt = localStorage.getItem("kioku.sync.at");
       const remoteNewer = !localAt || new Date(data.updated_at) > new Date(localAt);
       if (remoteNewer && data.data) {
-        const d = data.data;
+        // クラウド側に古い版のサンプルデータが残っていることがあるので、ここでも取り除きます。
+        const d = stripSample(data.data).data;
         const next = {
           decks: d.decks || [],
           cards: d.cards || [],
@@ -1413,6 +1407,42 @@ class App extends Component {
             style=${Object.assign({}, field, { flex: 1 })}
           />
           <button style=${primary} onClick=${() => this.createDeck()}>作成</button>
+        </div>`}
+
+        ${!s.decks.length &&
+        html`<div
+          style=${{
+            background: C.surface,
+            border: "1px dashed " + C.line,
+            borderRadius: 18,
+            padding: n ? "26px 20px" : "34px 30px",
+            textAlign: "center",
+          }}
+        >
+          <div style=${{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>まだデッキがありません</div>
+          <p style=${{ margin: "0 0 16px", fontSize: 13, lineHeight: 1.8, color: C.muted }}>
+            「デッキを追加」で覚えたいことのまとまりを作り、カードを入れていきます。<br />
+            手元の単語帳やスプレッドシートがあれば「一括で取り込む」から貼り付けられます。
+          </p>
+          <div style=${{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+            <button style=${primary} onClick=${() => this.setState({ newDeckOpen: true, quickOpen: false })}>
+              デッキを作る
+            </button>
+            <button
+              class="soft"
+              style=${{
+                background: C.bg,
+                border: "1px solid " + C.line,
+                color: C.inkSoft,
+                borderRadius: 10,
+                padding: "11px 18px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.openImport(null, "home")}
+            >
+              一括で取り込む
+            </button>
+          </div>
         </div>`}
 
         <div style=${{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(272px, 1fr))", gap: 16 }}>
