@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v14";
+const BUILD = "v15";
 
 const C = {
   bg: "#F3EFE6",
@@ -2346,7 +2346,7 @@ class App extends Component {
         </button>
         <h2 style=${h2Style}>カードを一括取り込み</h2>
         <p style=${{ fontSize: 13, color: C.muted, lineHeight: 1.9, margin: "8px 0 22px" }}>
-          1行に1枚。<strong>表</strong> ・ <strong>裏</strong> ・ <strong>補足（省略可）</strong> の順に区切って貼り付けてください。
+          1行に1枚。<strong>表</strong> ・ <strong>裏</strong> ・ <strong>補足（省略可）</strong> の順に、カンマかタブで区切って貼り付けてください。
           スプレッドシートからそのままコピーできます。区切り文字を含む文は <code>"…"</code> で囲みます。
         </p>
 
@@ -2418,7 +2418,7 @@ class App extends Component {
 
           <textarea
             rows=${n ? 8 : 10}
-            placeholder=${"abundant\t豊富な\tan abundant supply of water\ncomply\t（規則に）従う"}
+            placeholder=${"acute,鋭い,an acute pain\ngrasp,理解する"}
             value=${s.impText}
             onInput=${(e) => this.setState({ impText: e.target.value })}
             style=${Object.assign({}, field, {
