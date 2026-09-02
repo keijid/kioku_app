@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v9";
+const BUILD = "v10";
 
 const C = {
   bg: "#F3EFE6",
@@ -508,6 +508,7 @@ class App extends Component {
   async diagnose() {
     const c = this.cfg();
     const lines = ["診断結果  ビルド " + BUILD];
+    if (this._sbNote) lines.push(this._sbNote);
     if (!c || !c.url || !c.key) {
       lines.push("接続情報が未設定です");
       this.setState({ syncError: lines.join("\n") });
@@ -546,7 +547,19 @@ class App extends Component {
   async loadSb() {
     const c = this.cfg();
     if (!c || !c.url || !c.key) throw new Error("接続情報が未設定です");
-    if (this._sb) return this._sb;
+    // 使い回す前にも中身を確かめる。何かに書き換わっていたら作り直します。
+    if (this._sbClient) {
+      if (this._sbClient.auth && typeof this._sbClient.auth.signInWithPassword === "function") {
+        return this._sbClient;
+      }
+      this._sbNote =
+        "保持していたクライアントが別のものに変わっていました：" +
+        Object.prototype.toString.call(this._sbClient) +
+        " [" +
+        Object.keys(this._sbClient || {}).slice(0, 8).join(",") +
+        "]";
+      this._sbClient = null;
+    }
 
     const notes = [];
     for (let i = 0; i < SB_SOURCES.length; i++) {
@@ -578,7 +591,7 @@ class App extends Component {
         notes.push(where + "：SDKの形式が想定と違います");
         continue;
       }
-      this._sb = client;
+      this._sbClient = client;
       return client;
     }
     throw new Error("Supabase SDK を読み込めませんでした。" + notes.join(" / "));
@@ -749,7 +762,7 @@ class App extends Component {
       return;
     }
     localStorage.setItem("kioku.sync.cfg", JSON.stringify({ url: origin, key }));
-    this._sb = null;
+    this._sbClient = null;
     this.setState({ sbUrl: origin, syncError: null });
     this.toast("接続情報を保存しました");
     this.initSync();
@@ -758,7 +771,7 @@ class App extends Component {
   clearCfg() {
     localStorage.removeItem("kioku.sync.cfg");
     localStorage.removeItem("kioku.sync.at");
-    this._sb = null;
+    this._sbClient = null;
     this.setState({ syncUser: null, syncAt: null, sbUrl: "", sbKey: "" });
     this.toast("接続を解除しました");
   }
