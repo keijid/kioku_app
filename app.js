@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v21";
+const BUILD = "v22";
 
 const C = {
   bg: "#F3EFE6",
@@ -101,6 +101,18 @@ let uidSeq = 0;
 function uid(prefix) {
   uidSeq += 1;
   return prefix + Date.now().toString(36) + uidSeq.toString(36);
+}
+
+// 配列をシャッフルした新しい配列を返す（Fisher-Yates）。学習の出題順に使います。
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = a[i];
+    a[i] = a[j];
+    a[j] = t;
+  }
+  return a;
 }
 
 // ---------------------------------------------------------------- 一括取り込みのパーサ
@@ -385,8 +397,12 @@ class App extends Component {
   }
 
   startStudy(deckId) {
-    const q = this.dueCards(deckId)
-      .sort((a, b) => (a.state === "new" ? 1 : 0) - (b.state === "new" ? 1 : 0))
+    // 出題順はセッションごとにシャッフルします（同じ並びで覚えてしまうのを防ぐため）。
+    // ただし「復習が先、新規が後」の並びは保ちます。新規を混ぜると、その日の復習が
+    // 終わらないうちに新しいカードが割り込んでしまうためです。
+    const due = this.dueCards(deckId);
+    const q = shuffle(due.filter((c) => c.state !== "new"))
+      .concat(shuffle(due.filter((c) => c.state === "new")))
       .map((c) => c.id);
     if (!q.length) {
       this.toast(this.state.cards.length ? "このデッキは今日の分が終わっています" : "まずはカードを追加してください");
