@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v22";
+const BUILD = "v23";
 
 const C = {
   bg: "#F3EFE6",
@@ -113,6 +113,14 @@ function shuffle(arr) {
     a[j] = t;
   }
   return a;
+}
+
+// 読み上げの言語を決めます。ラテン文字が仮名・漢字より多ければ英語として読みます。
+// 英単語と日本語の用語が同じデッキに混ざっていても、それぞれ自然に読ませるためです。
+function speechLang(text) {
+  const latin = (text.match(/[A-Za-z]/g) || []).length;
+  const jp = (text.match(/[ぁ-んァ-ヶー一-龥]/g) || []).length;
+  return latin > jp ? "en-US" : "ja-JP";
 }
 
 // ---------------------------------------------------------------- 一括取り込みのパーサ
@@ -275,6 +283,8 @@ class App extends Component {
     renamingDeck: false,
     renameName: "",
     toast: null,
+    // 読み上げが使えるか（音声が1つも無い端末ではボタンを出しません）
+    canSpeak: false,
     // 一括取り込み
     impFrom: "home",
     impText: "",
@@ -333,6 +343,20 @@ class App extends Component {
       this.toast("サンプルデータを削除しました");
     }
 
+    // 読み上げが使えるか調べます。getVoices() は最初は空で返ることがあるので、
+    // voiceschanged でもう一度確かめます（端末に音声が無ければボタンを出しません）。
+    if (window.speechSynthesis) {
+      this._voiceCheck = () => {
+        let ok = false;
+        try {
+          ok = window.speechSynthesis.getVoices().length > 0;
+        } catch (e) {}
+        if (ok !== this.state.canSpeak) this.setState({ canSpeak: ok });
+      };
+      this._voiceCheck();
+      window.speechSynthesis.addEventListener("voiceschanged", this._voiceCheck);
+    }
+
     this._key = (e) => this.onKey(e);
     window.addEventListener("keydown", this._key);
     this._rz = () => {
@@ -356,6 +380,10 @@ class App extends Component {
   }
 
   componentWillUnmount() {
+    if (window.speechSynthesis && this._voiceCheck) {
+      window.speechSynthesis.removeEventListener("voiceschanged", this._voiceCheck);
+      window.speechSynthesis.cancel();
+    }
     window.removeEventListener("keydown", this._key);
     window.removeEventListener("resize", this._rz);
     clearTimeout(this._toastT);
@@ -381,6 +409,61 @@ class App extends Component {
       this.toast("端末に保存できませんでした（空き容量が足りません）");
     }
     this.queuePush();
+  }
+
+  // 端末内蔵の合成音声で読み上げます（Web Speech API）。
+  // 音声ファイルは一切持たないので、カードのデータ構造も同期も変わりません。
+  // 名前は Preact の Component が持たないものを選んでいます。
+  speak(text) {
+    if (!text || !window.speechSynthesis) return;
+    try {
+      window.speechSynthesis.cancel(); // 連打したときに前の発話を止める
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = speechLang(text);
+      u.rate = 0.95;
+      window.speechSynthesis.speak(u);
+    } catch (e) {}
+  }
+
+  // 読み上げボタン。音声が使えない端末では何も描きません。
+  speakButton(text) {
+    if (!this.state.canSpeak || !text) return null;
+    return html`<button
+      class="ghost"
+      title="読み上げる"
+      aria-label="読み上げる"
+      style=${{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 34,
+        height: 34,
+        padding: 0,
+        background: "none",
+        border: "1px solid " + C.line,
+        borderRadius: 99,
+        color: C.faint,
+      }}
+      onClick=${(e) => {
+        e.stopPropagation();
+        this.speak(text);
+      }}
+    >
+      <svg
+        width="17"
+        height="17"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.8"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M4 9.5v5h3.5L12 18V6L7.5 9.5H4z" />
+        <path d="M16 9.2a4 4 0 0 1 0 5.6" />
+        <path d="M18.6 6.6a7.6 7.6 0 0 1 0 10.8" />
+      </svg>
+    </button>`;
   }
 
   toast(msg) {
@@ -469,6 +552,7 @@ class App extends Component {
   rate(grade) {
     const id = this.state.queue[0];
     if (!id) return;
+    if (window.speechSynthesis) window.speechSynthesis.cancel(); // 次のカードへ進むので読み上げを止める
     const card = this.state.cards.find((c) => c.id === id);
     const updated = this.schedule(card, grade);
     const cards = this.state.cards.map((c) => (c.id === id ? updated : c));
@@ -1843,6 +1927,9 @@ class App extends Component {
               <div style=${{ fontSize: n ? 24 : 32, fontWeight: 700, lineHeight: 1.45, textWrap: "pretty" }}>
                 ${card ? card.front : ""}
               </div>
+              ${card &&
+              this.state.canSpeak &&
+              html`<div style=${{ marginTop: 14 }}>${this.speakButton(card.front)}</div>`}
               ${s.showAnswer &&
               html`<div
                 style=${{
@@ -1855,6 +1942,9 @@ class App extends Component {
                 <div style=${{ fontSize: n ? 19 : 24, lineHeight: 1.6, color: "#2E3648", textWrap: "pretty" }}>
                   ${card ? card.back : ""}
                 </div>
+                ${card &&
+                this.state.canSpeak &&
+                html`<div style=${{ marginTop: 12 }}>${this.speakButton(card.back)}</div>`}
                 ${card &&
                 card.hint &&
                 html`<div
@@ -1871,7 +1961,9 @@ class App extends Component {
                     textWrap: "pretty",
                   }}
                 >
-                  ${card.hint}
+                  <div>${card.hint}</div>
+                  ${this.state.canSpeak &&
+                  html`<div style=${{ marginTop: 10 }}>${this.speakButton(card.hint)}</div>`}
                 </div>`}
               </div>`}
             </div>
