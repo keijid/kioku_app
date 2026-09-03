@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v20";
+const BUILD = "v21";
 
 const C = {
   bg: "#F3EFE6",
@@ -259,6 +259,9 @@ class App extends Component {
     editBack: "",
     editHint: "",
     confirmingDelete: false,
+    // デッキ名のその場編集。真のとき見出しが入力欄に切り替わります
+    renamingDeck: false,
+    renameName: "",
     toast: null,
     // 一括取り込み
     impFrom: "home",
@@ -396,6 +399,9 @@ class App extends Component {
       showAnswer: false,
       history: [],
       tally: { again: 0, hard: 0, good: 0, easy: 0 },
+      renamingDeck: false,
+      confirmingDelete: false,
+      editId: null,
     });
   }
 
@@ -1182,7 +1188,7 @@ class App extends Component {
       >
         <div
           style=${{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer", flexShrink: 0 }}
-          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false, editId: null })}
+          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false, renamingDeck: false, editId: null })}
         >
           <div
             style=${{
@@ -1581,7 +1587,7 @@ class App extends Component {
                   </button>
                   <button
                     class="soft"
-                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false, editId: null })}
+                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false, renamingDeck: false, editId: null })}
                     style=${{
                       background: C.bg,
                       border: "1px solid " + C.line,
@@ -1994,7 +2000,7 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
-        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false, editId: null })}>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false, renamingDeck: false, editId: null })}>
           ← デッキ一覧
         </button>
         <div
@@ -2007,13 +2013,65 @@ class App extends Component {
             marginBottom: 22,
           }}
         >
-          <div>
-            <h2 style=${h2Style}>${deck ? deck.name : ""}</h2>
+          <div style=${{ minWidth: 0, flex: "1 1 260px" }}>
+            ${s.renamingDeck
+              ? html`<div style=${{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <input
+                    placeholder="デッキ名"
+                    value=${s.renameName}
+                    onInput=${(e) => this.setState({ renameName: e.target.value })}
+                    onKeyDown=${(e) => {
+                      if (e.key === "Enter") this.saveRename();
+                      if (e.key === "Escape") this.setState({ renamingDeck: false });
+                    }}
+                    style=${Object.assign({}, field, {
+                      fontSize: 18,
+                      fontWeight: 700,
+                      flex: n ? "1 1 100%" : "1 1 200px",
+                      minWidth: 0,
+                    })}
+                  />
+                  <button style=${Object.assign({}, primary, { flexShrink: 0 })} onClick=${() => this.saveRename()}>
+                    保存
+                  </button>
+                  <button
+                    class="soft"
+                    style=${{
+                      background: C.bg,
+                      border: "1px solid " + C.line,
+                      color: C.inkSoft,
+                      borderRadius: 10,
+                      padding: "12px 18px",
+                      fontSize: 13,
+                      flexShrink: 0,
+                    }}
+                    onClick=${() => this.setState({ renamingDeck: false })}
+                  >
+                    キャンセル
+                  </button>
+                </div>`
+              : html`<h2 style=${h2Style}>${deck ? deck.name : ""}</h2>`}
             <div style=${{ fontSize: 13, color: C.faint, marginTop: 4 }}>
               ${cards.length} 枚 ・ ${deck ? deck.sub : ""}
             </div>
           </div>
-          <div style=${{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div style=${{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            ${!s.confirmingDelete &&
+            !s.renamingDeck &&
+            html`<button
+              class="ghost"
+              style=${{
+                background: "none",
+                border: "1px solid " + C.line,
+                color: C.inkSoft,
+                borderRadius: 12,
+                padding: "13px 16px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.startRename()}
+            >
+              名前を変更
+            </button>`}
             ${!s.confirmingDelete &&
             html`<button
               class="danger"
@@ -2025,7 +2083,7 @@ class App extends Component {
                 padding: "13px 16px",
                 fontSize: 13,
               }}
-              onClick=${() => this.setState({ confirmingDelete: true })}
+              onClick=${() => this.setState({ confirmingDelete: true, renamingDeck: false })}
             >
               デッキを削除
             </button>`}
@@ -2363,11 +2421,41 @@ class App extends Component {
     this.toast("カードを削除しました");
   }
 
+  startRename() {
+    const s = this.state;
+    const deck = s.decks.find((d) => d.id === s.deckId);
+    if (!deck) return;
+    this.setState({ renamingDeck: true, renameName: deck.name, confirmingDelete: false });
+  }
+
+  // デッキ名だけを書き換えます。カードと学習の進み具合には触れません。
+  saveRename() {
+    const s = this.state;
+    const name = (s.renameName || "").trim();
+    if (!name) {
+      this.toast("デッキ名を入力してください");
+      return;
+    }
+    const deck = s.decks.find((d) => d.id === s.deckId);
+    if (!deck) {
+      this.setState({ renamingDeck: false });
+      return;
+    }
+    if (name === deck.name) {
+      this.setState({ renamingDeck: false });
+      return;
+    }
+    const decks = s.decks.map((d) => (d.id === s.deckId ? Object.assign({}, d, { name }) : d));
+    this.setState({ decks, renamingDeck: false });
+    this.persist({ decks });
+    this.toast("デッキ名を変更しました");
+  }
+
   deleteDeck() {
     const s = this.state;
     const decks = s.decks.filter((d) => d.id !== s.deckId);
     const cards = s.cards.filter((c) => c.deckId !== s.deckId);
-    this.setState({ decks, cards, confirmingDelete: false, screen: "home", deckId: null, editId: null });
+    this.setState({ decks, cards, confirmingDelete: false, renamingDeck: false, screen: "home", deckId: null, editId: null });
     this.persist({ decks, cards });
     this.toast("デッキを削除しました");
   }
@@ -2430,7 +2518,7 @@ class App extends Component {
             </button>
             <button
               style=${Object.assign({}, primary, { padding: "10px 18px" })}
-              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false, editId: null })}
+              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false, renamingDeck: false, editId: null })}
             >
               デッキを見る
             </button>
