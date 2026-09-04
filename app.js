@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v24";
+const BUILD = "v25";
 
 const C = {
   bg: "#F3EFE6",
@@ -282,6 +282,11 @@ class App extends Component {
     // デッキ名のその場編集。真のとき見出しが入力欄に切り替わります
     renamingDeck: false,
     renameName: "",
+    // 表裏の反転複製。真のとき確認の帯が出ます
+    reversing: false,
+    revDest: "same", // "same"（このデッキに追加）/ "__new"（新しいデッキ）
+    revNewName: "",
+    lastReverse: null, // { ids, deckId, deckCreated } 取り消し用
     toast: null,
     // 読み上げが使えるか（音声が1つも無い端末ではボタンを出しません）
     canSpeak: false,
@@ -501,6 +506,8 @@ class App extends Component {
       tally: { again: 0, hard: 0, good: 0, easy: 0 },
       renamingDeck: false,
       confirmingDelete: false,
+      reversing: false,
+      lastReverse: null,
       editId: null,
     });
   }
@@ -1293,7 +1300,7 @@ class App extends Component {
       >
         <div
           style=${{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer", flexShrink: 0 }}
-          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false, renamingDeck: false, editId: null })}
+          onClick=${() => this.setState({ screen: "home", showAnswer: false, confirmingDelete: false, renamingDeck: false, reversing: false, lastReverse: null, editId: null })}
         >
           <div
             style=${{
@@ -1692,7 +1699,7 @@ class App extends Component {
                   </button>
                   <button
                     class="soft"
-                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false, renamingDeck: false, editId: null })}
+                    onClick=${() => this.setState({ screen: "deck", deckId: x.d.id, confirmingDelete: false, renamingDeck: false, reversing: false, lastReverse: null, editId: null })}
                     style=${{
                       background: C.bg,
                       border: "1px solid " + C.line,
@@ -2131,7 +2138,7 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
-        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false, renamingDeck: false, editId: null })}>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home", confirmingDelete: false, renamingDeck: false, reversing: false, lastReverse: null, editId: null })}>
           ← デッキ一覧
         </button>
         <div
@@ -2189,6 +2196,7 @@ class App extends Component {
           <div style=${{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             ${!s.confirmingDelete &&
             !s.renamingDeck &&
+            !s.reversing &&
             html`<button
               class="ghost"
               style=${{
@@ -2204,6 +2212,24 @@ class App extends Component {
               名前を変更
             </button>`}
             ${!s.confirmingDelete &&
+            !s.renamingDeck &&
+            !s.reversing &&
+            html`<button
+              class="ghost"
+              style=${{
+                background: "none",
+                border: "1px solid " + C.line,
+                color: C.inkSoft,
+                borderRadius: 12,
+                padding: "13px 16px",
+                fontSize: 13,
+              }}
+              onClick=${() => this.startReverseDeck()}
+            >
+              反転して複製
+            </button>`}
+            ${!s.confirmingDelete &&
+            !s.reversing &&
             html`<button
               class="danger"
               style=${{
@@ -2214,7 +2240,7 @@ class App extends Component {
                 padding: "13px 16px",
                 fontSize: 13,
               }}
-              onClick=${() => this.setState({ confirmingDelete: true, renamingDeck: false })}
+              onClick=${() => this.setState({ confirmingDelete: true, renamingDeck: false, reversing: false })}
             >
               デッキを削除
             </button>`}
@@ -2283,6 +2309,115 @@ class App extends Component {
               削除する
             </button>
           </div>
+        </div>`}
+
+        ${s.reversing &&
+        (() => {
+          const p = this.reversePreview();
+          const tab = (on) => ({
+            background: on ? C.accent : C.surface,
+            border: "1px solid " + (on ? C.accent : C.line),
+            color: on ? C.ink : C.muted,
+            borderRadius: 10,
+            padding: "10px 16px",
+            fontSize: 13,
+            fontWeight: on ? 700 : 400,
+          });
+          return html`<div
+            style=${{
+              background: C.field,
+              border: "1px solid " + C.accentDeep,
+              borderRadius: 16,
+              padding: "16px 18px",
+              marginBottom: 18,
+              display: "grid",
+              gap: 12,
+              animation: "kk-rise .2s ease both",
+            }}
+          >
+            <div style=${{ fontSize: 13, color: C.inkSoft, lineHeight: 1.7 }}>
+              このデッキの表と裏を入れ替えたカードを作ります。補足はそのまま残り、
+              学習の進み具合は新しいカードとしてやり直しになります。
+            </div>
+            <div style=${{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <span style=${{ fontSize: 12, color: C.faint }}>追加先</span>
+              <button style=${tab(s.revDest === "same")} onClick=${() => this.setState({ revDest: "same" })}>
+                このデッキ
+              </button>
+              <button style=${tab(s.revDest === "__new")} onClick=${() => this.setState({ revDest: "__new" })}>
+                新しいデッキ
+              </button>
+            </div>
+            ${s.revDest === "__new" &&
+            html`<input
+              placeholder="新しいデッキ名"
+              value=${s.revNewName}
+              onInput=${(e) => this.setState({ revNewName: e.target.value })}
+              onKeyDown=${(e) => {
+                if (e.key === "Enter") this.runReverseDeck();
+                if (e.key === "Escape") this.setState({ reversing: false });
+              }}
+              style=${Object.assign({}, field, { width: "100%", boxSizing: "border-box" })}
+            />`}
+            <div style=${{ fontSize: 13, color: C.inkSoft, lineHeight: 1.7 }}>
+              <strong>${p.keep.length}</strong> 枚を追加します。
+              ${p.dup > 0 && html`<span style=${{ color: C.faint }}>
+                ${p.dup} 枚は同じ表のカードが既にあるため飛ばします。
+              </span>`}
+            </div>
+            <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button style=${primary} onClick=${() => this.runReverseDeck()}>複製する</button>
+              <button
+                class="soft"
+                style=${{
+                  background: C.bg,
+                  border: "1px solid " + C.line,
+                  color: C.inkSoft,
+                  borderRadius: 10,
+                  padding: "12px 18px",
+                  fontSize: 13,
+                }}
+                onClick=${() => this.setState({ reversing: false })}
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>`;
+        })()}
+
+        ${!s.reversing &&
+        s.lastReverse &&
+        html`<div
+          style=${{
+            background: C.surface,
+            border: "1px solid " + C.line,
+            borderRadius: 14,
+            padding: "12px 16px",
+            marginBottom: 18,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style=${{ fontSize: 13, color: C.muted }}>
+            ${s.lastReverse.ids.length} 枚を反転して追加しました。
+          </div>
+          <button
+            class="ghost"
+            style=${{
+              background: "none",
+              border: "1px solid " + C.line,
+              color: C.inkSoft,
+              borderRadius: 10,
+              padding: "9px 14px",
+              fontSize: 13,
+            }}
+            onClick=${() => this.undoReverse()}
+          >
+            取り消す
+          </button>
         </div>`}
 
         <div style=${Object.assign({}, box, { padding: 18, marginBottom: 20 })}>
@@ -2490,6 +2625,20 @@ class App extends Component {
             キャンセル
           </button>
           <button
+            class="ghost"
+            style=${{
+              background: "none",
+              border: "1px solid " + C.line,
+              color: C.inkSoft,
+              borderRadius: 10,
+              padding: "12px 16px",
+              fontSize: 13,
+            }}
+            onClick=${() => this.duplicateReversed(c)}
+          >
+            反転して複製
+          </button>
+          <button
             class="danger"
             style=${{
               marginLeft: "auto",
@@ -2552,11 +2701,134 @@ class App extends Component {
     this.toast("カードを削除しました");
   }
 
+  // ---- 表裏の反転複製 ----
+
+  // 表と裏を入れ替えた新しいカードを作ります。補足（hint）は入れ替えず、そのまま持っていきます。
+  // 学習の進み具合は new からやり直しです。英→日（見て分かる）と日→英（思い出して書く）は
+  // 難しさが別物なので、元カードの ease / interval を引き継ぐと復習間隔が飛びすぎます。
+  reverseOf(c, deckId) {
+    return this.newCard(deckId || c.deckId, c.back, c.front, c.hint);
+  }
+
+  // 反転で増える枚数と、既にあるためスキップする枚数を数えます。描画のたびに呼びます。
+  // 重複の判定は一括取り込みと同じく「表が一致するか」だけを見ます。
+  reversePreview() {
+    const s = this.state;
+    const src = s.cards.filter((c) => c.deckId === s.deckId);
+    // 新しいデッキへ出すときは、まだ何も無いので既存カードとの重複は起きません。
+    const seen = new Set(s.revDest === "__new" ? [] : src.map((c) => c.front.trim()));
+    const keep = [];
+    let dup = 0;
+    src.forEach((c) => {
+      const f = (c.back || "").trim();
+      if (!f || seen.has(f)) {
+        dup++;
+        return;
+      }
+      seen.add(f);
+      keep.push(c);
+    });
+    return { keep, dup, total: src.length };
+  }
+
+  startReverseDeck() {
+    const s = this.state;
+    const deck = s.decks.find((d) => d.id === s.deckId);
+    if (!deck) return;
+    if (!s.cards.some((c) => c.deckId === s.deckId)) {
+      this.toast("反転するカードがありません");
+      return;
+    }
+    this.setState({
+      reversing: true,
+      revDest: "same",
+      revNewName: deck.name + "（逆）",
+      confirmingDelete: false,
+      renamingDeck: false,
+      editId: null,
+      lastReverse: null,
+    });
+  }
+
+  runReverseDeck() {
+    const s = this.state;
+    const p = this.reversePreview();
+    if (!p.keep.length) {
+      this.toast("追加できるカードがありません");
+      return;
+    }
+    let decks = s.decks;
+    let deckId = s.deckId;
+    let deckCreated = false;
+    if (s.revDest === "__new") {
+      const name = (s.revNewName || "").trim();
+      if (!name) {
+        this.toast("デッキ名を入力してください");
+        return;
+      }
+      deckId = uid("d");
+      deckCreated = true;
+      decks = decks.concat([{ id: deckId, name, sub: "自作デッキ" }]);
+    }
+    const added = p.keep.map((c) => this.reverseOf(c, deckId));
+    const cards = s.cards.concat(added);
+    const next = {
+      decks,
+      cards,
+      reversing: false,
+      lastReverse: { ids: added.map((x) => x.id), deckId, deckCreated },
+    };
+    this.setState(next);
+    this.persist(next);
+    this.toast(added.length + "枚を反転して追加しました");
+  }
+
+  undoReverse() {
+    const s = this.state;
+    const lr = s.lastReverse;
+    if (!lr) return;
+    const ids = new Set(lr.ids);
+    const cards = s.cards.filter((c) => !ids.has(c.id));
+    const decks = lr.deckCreated ? s.decks.filter((d) => d.id !== lr.deckId) : s.decks;
+    const next = { decks, cards, lastReverse: null, editId: null };
+    // 作ったばかりのデッキを開いたまま取り消した場合の保険（通常は画面を移ると lastReverse が消えます）
+    if (lr.deckCreated && s.deckId === lr.deckId) {
+      next.screen = "home";
+      next.deckId = null;
+    }
+    this.setState(next);
+    this.persist(next);
+    this.toast("反転して複製したカードを取り消しました");
+  }
+
+  // カード1枚を反転して複製します（その場編集の中から）。行き先は同じデッキです。
+  // 入力欄に見えている内容をそのまま使うので、元のカードへの変更も一緒に保存します
+  // （保存を押してから複製、の二度手間をなくすため）。
+  duplicateReversed(c) {
+    const s = this.state;
+    const front = (s.editFront || "").trim();
+    const back = (s.editBack || "").trim();
+    const hint = (s.editHint || "").trim();
+    if (!front || !back) {
+      this.toast("表と裏の両方を入力してください");
+      return;
+    }
+    const saved = s.cards.map((x) => (x.id === c.id ? Object.assign({}, x, { front, back, hint }) : x));
+    if (saved.some((x) => x.deckId === c.deckId && x.front.trim() === back)) {
+      this.toast("反転したカードは既にあります");
+      return;
+    }
+    const cards = saved.concat([this.reverseOf({ front, back, hint }, c.deckId)]);
+    this.setState({ cards, editId: null });
+    this.persist({ cards });
+    this.toast("表裏を反転して複製しました");
+  }
+
   startRename() {
     const s = this.state;
     const deck = s.decks.find((d) => d.id === s.deckId);
     if (!deck) return;
-    this.setState({ renamingDeck: true, renameName: deck.name, confirmingDelete: false });
+    this.setState({ renamingDeck: true, renameName: deck.name, confirmingDelete: false, reversing: false });
   }
 
   // デッキ名だけを書き換えます。カードと学習の進み具合には触れません。
@@ -2586,7 +2858,17 @@ class App extends Component {
     const s = this.state;
     const decks = s.decks.filter((d) => d.id !== s.deckId);
     const cards = s.cards.filter((c) => c.deckId !== s.deckId);
-    this.setState({ decks, cards, confirmingDelete: false, renamingDeck: false, screen: "home", deckId: null, editId: null });
+    this.setState({
+      decks,
+      cards,
+      confirmingDelete: false,
+      renamingDeck: false,
+      reversing: false,
+      lastReverse: null,
+      screen: "home",
+      deckId: null,
+      editId: null,
+    });
     this.persist({ decks, cards });
     this.toast("デッキを削除しました");
   }
@@ -2649,7 +2931,7 @@ class App extends Component {
             </button>
             <button
               style=${Object.assign({}, primary, { padding: "10px 18px" })}
-              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false, renamingDeck: false, editId: null })}
+              onClick=${() => this.setState({ screen: "deck", deckId: li.deckId, confirmingDelete: false, renamingDeck: false, reversing: false, lastReverse: null, editId: null })}
             >
               デッキを見る
             </button>
