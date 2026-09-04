@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v23";
+const BUILD = "v24";
 
 const C = {
   bg: "#F3EFE6",
@@ -438,6 +438,7 @@ class App extends Component {
         justifyContent: "center",
         width: 34,
         height: 34,
+        flexShrink: 0,
         padding: 0,
         background: "none",
         border: "1px solid " + C.line,
@@ -1237,7 +1238,11 @@ class App extends Component {
 
     return html`
       <div style=${{ minHeight: "100vh", background: C.bg, padding: "0 20px 80px" }}>
-        ${this.renderHeader(st)}
+        ${
+          // 学習中はヘッダーを出しません。スマホだと縦が足りず、評価ボタンを押すのに
+          // スクロールが要るためです（「中断する」で home に戻れば元に戻ります）。
+          s.screen !== "study" && this.renderHeader(st)
+        }
         ${(s.screen === "home" || s.screen === "login") && this.renderHome(st, box, field, primary)}
         ${s.screen === "study" && this.renderStudy()}
         ${s.screen === "done" && this.renderDone()}
@@ -1872,7 +1877,7 @@ class App extends Component {
     ];
 
     return html`
-      <main style=${{ maxWidth: 760, margin: "0 auto" }}>
+      <main style=${{ maxWidth: 760, margin: "0 auto", paddingTop: n ? 14 : 20 }}>
         <div style=${{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}>
           <button
             style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "6px 0" }}
@@ -1916,40 +1921,45 @@ class App extends Component {
 
           <div
             style=${{
-              minHeight: n ? 160 : 210,
+              // 答えを出したら minHeight は不要（表だけのときにカードを見栄えよくするためのもの）
+              minHeight: s.showAnswer ? 0 : n ? 160 : 210,
               display: "grid",
               placeItems: "center",
-              padding: n ? "30px 20px" : "46px 32px",
+              padding: s.showAnswer ? (n ? "22px 20px" : "32px 32px") : n ? "30px 20px" : "46px 32px",
               textAlign: "center",
             }}
           >
             <div>
-              <div style=${{ fontSize: n ? 24 : 32, fontWeight: 700, lineHeight: 1.45, textWrap: "pretty" }}>
-                ${card ? card.front : ""}
+              <div
+                style=${{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, flexWrap: "wrap" }}
+              >
+                <div style=${{ fontSize: n ? 24 : 32, fontWeight: 700, lineHeight: 1.45, textWrap: "pretty" }}>
+                  ${card ? card.front : ""}
+                </div>
+                ${card && this.speakButton(card.front)}
               </div>
-              ${card &&
-              this.state.canSpeak &&
-              html`<div style=${{ marginTop: 14 }}>${this.speakButton(card.front)}</div>`}
               ${s.showAnswer &&
               html`<div
                 style=${{
-                  marginTop: 26,
-                  paddingTop: 26,
+                  marginTop: 18,
+                  paddingTop: 18,
                   borderTop: "1px dashed #DDD5C4",
                   animation: "kk-rise .2s ease both",
                 }}
               >
-                <div style=${{ fontSize: n ? 19 : 24, lineHeight: 1.6, color: "#2E3648", textWrap: "pretty" }}>
-                  ${card ? card.back : ""}
+                <div
+                  style=${{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, flexWrap: "wrap" }}
+                >
+                  <div style=${{ fontSize: n ? 19 : 24, lineHeight: 1.6, color: "#2E3648", textWrap: "pretty" }}>
+                    ${card ? card.back : ""}
+                  </div>
+                  ${card && this.speakButton(card.back)}
                 </div>
-                ${card &&
-                this.state.canSpeak &&
-                html`<div style=${{ marginTop: 12 }}>${this.speakButton(card.back)}</div>`}
                 ${card &&
                 card.hint &&
                 html`<div
                   style=${{
-                    marginTop: 18,
+                    marginTop: 14,
                     padding: n ? "12px 14px" : "14px 18px",
                     background: C.bg,
                     borderRadius: 12,
@@ -1957,13 +1967,26 @@ class App extends Component {
                     lineHeight: 1.8,
                     color: C.muted,
                     textAlign: "left",
-                    whiteSpace: "pre-wrap",
-                    textWrap: "pretty",
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 10,
                   }}
                 >
-                  <div>${card.hint}</div>
-                  ${this.state.canSpeak &&
-                  html`<div style=${{ marginTop: 10 }}>${this.speakButton(card.hint)}</div>`}
+                  <div
+                    style=${{
+                      flex: 1,
+                      minWidth: 0,
+                      whiteSpace: "pre-wrap",
+                      textWrap: "pretty",
+                      // スマホでは4行までにして、それ以上は枠の中でスクロールさせます。
+                      // 補足が長くても評価ボタンが画面の外へ押し出されないようにするためです。
+                      maxHeight: n ? Math.round(14 * 1.8 * 4) : null,
+                      overflowY: n ? "auto" : null,
+                    }}
+                  >
+                    ${card.hint}
+                  </div>
+                  ${this.speakButton(card.hint)}
                 </div>`}
               </div>`}
             </div>
