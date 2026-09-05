@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v25";
+const BUILD = "v26";
 
 const C = {
   bg: "#F3EFE6",
@@ -371,6 +371,35 @@ class App extends Component {
     this._rz();
     window.addEventListener("resize", this._rz);
 
+    // 同期に使うログイン状態と、まだ送れていない変更の有無。
+    // どちらも setState を待たずに読めるよう、インスタンス変数で持ちます（理由は setSyncUser を参照）。
+    this._syncUserEmail = null;
+    this._pushPending = false;
+    // 送信・取り込みが走っている最中かどうか。復帰と定期の見直しが重なっても二重に投げないための印です。
+    this._pushing = false;
+    this._pulling = false;
+
+    // 画面に戻ってきたとき・回線が戻ったときに同期を取り直します。これが無いと
+    // 起動時の1回しかクラウドを見に行かないので、別の端末で進めた分が降りてきません。
+    this._visibility = () => {
+      // hidden は端末を離れる直前です。デバウンス待ちの分をここで送り切ります。
+      // 待たせたままアプリを切り替えると、iOS はタブを凍結してタイマーが発火しません。
+      this.flushPush();
+      if (document.visibilityState !== "hidden" && this.canSyncNow()) this.pull(true);
+    };
+    document.addEventListener("visibilitychange", this._visibility);
+    this._pageHide = () => this.flushPush();
+    window.addEventListener("pagehide", this._pageHide);
+    this._online = () => {
+      this.flushPush();
+      if (this.canSyncNow()) this.pull(true);
+    };
+    window.addEventListener("online", this._online);
+    // 送りそこねた分（オフライン・失敗・学習中の競合）を定期的に送り直します。
+    this._syncTimer = setInterval(() => {
+      if (this._pushPending && this.canSyncNow()) this.flushPush();
+    }, 60000);
+
     const c = this.cfg();
     if (c) this.setState({ sbUrl: c.url, sbKey: c.key, syncAt: localStorage.getItem("kioku.sync.at") });
     // セッションが残っていれば復元が終わるまで待つ。ログイン済みの端末に
@@ -391,13 +420,26 @@ class App extends Component {
     }
     window.removeEventListener("keydown", this._key);
     window.removeEventListener("resize", this._rz);
+    document.removeEventListener("visibilitychange", this._visibility);
+    window.removeEventListener("pagehide", this._pageHide);
+    window.removeEventListener("online", this._online);
+    clearInterval(this._syncTimer);
     clearTimeout(this._toastT);
     clearTimeout(this._pushT);
   }
 
   // ---- 保存 ----
 
+  // 端末に保存し、クラウドへの送信も予約します。setState したらこちらを呼びます。
   persist(extra) {
+    this.persistLocal(extra);
+    this.queuePush();
+  }
+
+  // 端末に保存するだけで、クラウドへは送りません。
+  // クラウドから取り込んだ直後だけこちらを使います（取り込んだ内容をそのまま
+  // 押し戻すと、更新時刻をこの端末の時刻で書き直すだけの往復が毎回起きるため）。
+  persistLocal(extra) {
     const s = Object.assign({}, this.state, extra || {});
     try {
       localStorage.setItem(
@@ -413,7 +455,6 @@ class App extends Component {
     } catch (e) {
       this.toast("端末に保存できませんでした（空き容量が足りません）");
     }
-    this.queuePush();
   }
 
   // 端末内蔵の合成音声で読み上げます（Web Speech API）。
@@ -807,26 +848,47 @@ class App extends Component {
       const sb = await this.loadSb();
       const { data } = await sb.auth.getSession();
       const user = data && data.session ? data.session.user : null;
-      this.setState({ syncUser: user ? user.email : null, booting: false });
+      this.setSyncUser(user ? user.email : null);
+      this.setState({ booting: false });
       if (user) this.leaveLocalOnly();
       if (!this._authSub) {
         this._authSub = sb.auth.onAuthStateChange((evt, session) => {
           const u = session ? session.user.email : null;
-          if (u !== this.state.syncUser) {
-            this.setState({ syncUser: u });
-            if (u) {
-              this.leaveLocalOnly();
-              this.pull(true);
-            }
+          // 比較も setSyncUser が入れた値で行います。state.syncUser を見ると、
+          // 直前の setState がまだ反映されておらず二重に pull します。
+          if (u === this._syncUserEmail) return;
+          this.setSyncUser(u);
+          if (u) {
+            this.leaveLocalOnly();
+            this.pull(true);
           }
         });
       }
-      if (user) this.pull(true);
+      if (user) await this.pull(true);
     } catch (e) {
       // 復元するセッションが無いなら、まだ何もしていない人にエラーを見せる必要はありません。
       // 実際に困るのはログインを押したときで、そこで同じエラーが出ます。
       this.setState({ syncError: this._hadStoredSession ? this.errText(e) : null, booting: false });
     }
+  }
+
+  // 同期に使うログイン状態は、state ではなくこのインスタンス変数で持ちます。
+  // Preact の setState は次の描画まで this.state を書き換えないため、setState の直後に
+  // pull や push を呼ぶと this.state.syncUser がまだ null で、先頭の判定に弾かれて
+  // 何もせず返ってしまいます（ログイン直後とセッション復元後の取り込みが、
+  // 実際にこれで丸ごと動いていませんでした）。
+  // state.syncUser は画面表示用です。同期の判定はこちらを見ること。
+  setSyncUser(email) {
+    const v = email || null;
+    this._syncUserEmail = v;
+    if (this.state.syncUser !== v) this.setState({ syncUser: v });
+  }
+
+  // 今クラウドの内容を取り込んでよいか。学習中は取り込みません。出題キューはカードのIDだけを
+  // 持っているので、取り込みでカードが消えると renderStudy が参照先を見失います。
+  // 送れなかった分は _pushPending に残り、学習を終えてから送られます。
+  canSyncNow() {
+    return !!this._syncUserEmail && this.state.screen !== "study";
   }
 
   async signIn(mode) {
@@ -857,15 +919,15 @@ class App extends Component {
         return;
       }
       this.leaveLocalOnly();
+      this.setSyncUser(data.session.user.email);
       this.setState({
-        syncUser: data.session.user.email,
         syncPw: "",
         syncBusy: false,
         syncError: null,
         screen: this.state.screen === "login" ? "home" : this.state.screen,
       });
       this.toast("ログインしました");
-      this.pull(true);
+      await this.pull(true);
     } catch (e) {
       this.setState({ syncBusy: false, syncError: this.errText(e) });
     }
@@ -877,6 +939,9 @@ class App extends Component {
       await sb.auth.signOut();
     } catch (e) {}
     // 手元の学習データは消しません。入口のログイン画面に戻すだけです。
+    this._syncUserEmail = null;
+    this._pushPending = false;
+    clearTimeout(this._pushT);
     this.setState({ syncUser: null, syncAt: null, localOnly: false, syncPw: "", syncError: null, screen: "login" });
     localStorage.removeItem("kioku.localonly");
     this.toast("ログアウトしました");
@@ -887,27 +952,59 @@ class App extends Component {
     return { decks: s.decks, cards: s.cards, log: s.log, gradeTotals: s.gradeTotals, todayCount: s.todayCount };
   }
 
-  async push() {
-    if (!this.state.syncUser) return;
+  // force を渡したときだけ、クラウドの内容を確かめずに上書きします
+  // （同期画面の「この端末の内容で上書き」用）。
+  async push(force) {
+    if (!this._syncUserEmail || this._pushing) return;
+    clearTimeout(this._pushT);
+    this._pushing = true;
     this.setState({ syncBusy: true, syncError: null });
     try {
       const sb = await this.loadSb();
       const { data: u } = await sb.auth.getUser();
-      const at = new Date().toISOString();
+      // 書く前にクラウド側の更新時刻を確かめます。前回見た時刻より新しければ、別の端末が
+      // 先に書いています。そのまま upsert すると1行まるごと置き換わって相手の学習が消えるので、
+      // こちらは書かずに取り込み側へ回ります。
+      const cur = await sb.from("kioku_state").select("updated_at").eq("user_id", u.user.id).maybeSingle();
+      if (cur.error) throw cur.error;
+      const remoteAt = cur.data ? cur.data.updated_at : null;
+      const remoteMs = remoteAt ? new Date(remoteAt).getTime() : 0;
+      const seenAt = localStorage.getItem("kioku.sync.at");
+      const conflict = !!remoteAt && (!seenAt || remoteMs > new Date(seenAt).getTime());
+      if (conflict && !force) {
+        this._pushPending = true;
+        this._pushing = false; // 取り込みの中から送信が呼べるよう、先に外します
+        this.setState({ syncBusy: false });
+        if (this.canSyncNow()) {
+          await this.pull(true);
+          this.toast("別の端末の変更を取り込みました");
+        }
+        return;
+      }
+      // 端末の時計が遅れていても、クラウドにある時刻より必ず新しい値を書きます。
+      // ここを素の Date.now() に戻すと、時計が数分ずれた端末どうしで新旧の判定が
+      // ひっくり返り、遅れている側の学習が黙って消えます。
+      const at = new Date(Math.max(Date.now(), remoteMs + 1000)).toISOString();
       const { error } = await sb
         .from("kioku_state")
         .upsert({ user_id: u.user.id, data: this.payload(), updated_at: at });
       if (error) throw error;
       localStorage.setItem("kioku.sync.at", at);
+      this._pushPending = false;
       this.setState({ syncBusy: false, syncAt: at });
     } catch (e) {
+      // 送れなかった分は覚えておいて、復帰時・回線復活時・定期の見直しで送り直します。
+      this._pushPending = true;
       this.setState({ syncBusy: false, syncError: this.errText(e) });
+    } finally {
+      this._pushing = false;
     }
   }
 
   // 競合は updated_at が新しい方を採用（last-write-wins）
   async pull(silent) {
-    if (!this.state.syncUser) return;
+    if (!this._syncUserEmail || this._pulling) return;
+    this._pulling = true;
     this.setState({ syncBusy: true, syncError: null });
     try {
       const sb = await this.loadSb();
@@ -919,6 +1016,7 @@ class App extends Component {
         .maybeSingle();
       if (error) throw error;
       if (!data) {
+        // クラウドにまだ何もないので、この端末の内容で作ります。
         this.setState({ syncBusy: false });
         await this.push();
         return;
@@ -935,9 +1033,18 @@ class App extends Component {
           gradeTotals: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
           todayCount: (d.log && d.log[dayKey(Date.now())]) || 0,
         };
-        this.setState(Object.assign({}, next, { syncBusy: false, syncAt: data.updated_at }));
+        // 取り込みで消えたカードが出題キューに残らないようにします。
+        const alive = {};
+        next.cards.forEach((c) => {
+          alive[c.id] = 1;
+        });
+        const queue = this.state.queue.filter((id) => alive[id]);
+        this.setState(Object.assign({}, next, { queue, syncBusy: false, syncAt: data.updated_at }));
         localStorage.setItem("kioku.sync.at", data.updated_at);
-        this.persist(next);
+        // 取り込んだ内容をそのまま押し戻さないよう、persist ではなく persistLocal を使います。
+        this.persistLocal(next);
+        this._pushPending = false;
+        clearTimeout(this._pushT);
         if (!silent) this.toast("クラウドから復元しました");
       } else {
         this.setState({ syncBusy: false });
@@ -946,13 +1053,25 @@ class App extends Component {
       }
     } catch (e) {
       this.setState({ syncBusy: false, syncError: this.errText(e) });
+    } finally {
+      this._pulling = false;
     }
   }
 
   queuePush() {
-    if (!this.state.syncUser) return;
+    // まだログインの確認が済んでいなくても印は付けておきます。準備ができ次第送られます。
+    this._pushPending = true;
+    if (!this._syncUserEmail) return;
     clearTimeout(this._pushT);
     this._pushT = setTimeout(() => this.push(), 2500);
+  }
+
+  // デバウンス待ちの分を今すぐ送ります。画面を離れるとき・戻ってきたとき・回線が戻ったときに呼びます。
+  // 2.5秒待つだけだと、学習の直後にアプリを切り替えた分がそのまま送られずに終わります。
+  flushPush() {
+    if (!this._pushPending || !this._syncUserEmail || this._pushing) return;
+    clearTimeout(this._pushT);
+    this.push();
   }
 
   saveCfg() {
@@ -993,6 +1112,9 @@ class App extends Component {
     localStorage.removeItem("kioku.sync.cfg");
     localStorage.removeItem("kioku.sync.at");
     this._sbClient = null;
+    this._syncUserEmail = null;
+    this._pushPending = false;
+    clearTimeout(this._pushT);
     const back = DEFAULT_SB.url && DEFAULT_SB.key;
     this.setState({
       syncUser: null,
@@ -3606,11 +3728,12 @@ class App extends Component {
                   </button>
                 </div>
                 <div style=${{ fontSize: 12, color: C.muted, lineHeight: 1.7, background: C.field, borderRadius: 12, padding: "12px 14px" }}>
-                  学習するたび自動でアップロードされます。別の端末では、同じアカウントでログインすれば最新の状態が取り込まれます。
+                  学習するたび自動でアップロードされます。アプリを閉じるときにも送るので、学習の直後に切り替えても取りこぼしません。
+                  別の端末の変更は、ログインしたときと画面に戻ってきたときに取り込まれます（学習中は取り込みません）。
                 </div>
                 <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <button style=${primary} onClick=${() => this.pull(false)}>今すぐ同期</button>
-                  <button class="soft" style=${secondary} onClick=${() => this.push()}>この端末の内容で上書き</button>
+                  <button class="soft" style=${secondary} onClick=${() => this.push(true)}>この端末の内容で上書き</button>
                 </div>
               </div>`}
         </div>`}
