@@ -1,4 +1,4 @@
-const CACHE = 'kioku-v27';
+const CACHE = 'kioku-v28';
 const ASSETS = [
   './',
   './index.html',
@@ -23,10 +23,27 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// キャッシュしてよい外部オリジン。**内容が変わらないものだけ**を並べること。
+// ここに Supabase の API を入れてはいけません。
+const CDN = [
+  'https://esm.sh',
+  'https://cdn.jsdelivr.net',
+  'https://fonts.googleapis.com',
+  'https://fonts.gstatic.com',
+];
+
 // アプリ本体は network-first（更新をすぐ拾う）、それ以外は cache-first。
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
+
+  // 同一オリジンと上の CDN 以外（＝ Supabase の API）は、何もせずネットワークに任せます。
+  // **この判定を外さないでください。** クラウドからの取り込みは GET なので、
+  // ここで拾うとキャッシュに載った古い応答が返り続けます。問い合わせURLは毎回同じなので、
+  // 一度載ると永久に古いままです。実際にこれで「PCで作ったデッキがスマホに出てこない」
+  // 状態になりました（書き込みは POST なので通り、読み取りだけが止まるので気づきにくい）。
+  if (url.origin !== location.origin && CDN.indexOf(url.origin) < 0) return;
+
   const isShell =
     url.origin === location.origin && /\/(index\.html|app\.js)?$/.test(url.pathname);
 

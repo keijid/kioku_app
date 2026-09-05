@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v27";
+const BUILD = "v28";
 
 const C = {
   bg: "#F3EFE6",
@@ -493,6 +493,12 @@ class App extends Component {
     // 送るものが無ければ相手の変更を取りに行きます。開きっぱなしの端末は
     // visibilitychange が起きないので、これが唯一の取り込みの機会になります。
     this._syncTimer = setInterval(() => {
+      // SDK の読み込みやセッション復元に一度失敗すると、その端末はログイン状態を
+      // 掴めないまま同期しなくなります（やり直す機会がどこにも無かった）。時々やり直します。
+      if (!this._syncUserEmail) {
+        if (this.cfg() && localStorage.getItem("kioku.sb.auth")) this.initSync();
+        return;
+      }
       if (!this.canSyncNow()) return;
       if (this._pushPending) this.flushPush();
       else if (document.visibilityState === "visible") this.pull(true);
@@ -855,7 +861,41 @@ class App extends Component {
       return;
     }
     lines.push("接続先 " + c.url + " / キー " + c.key.slice(0, 8) + "…（" + c.key.length + "文字）");
+    lines.push("");
+    lines.push("この端末  " + (this._syncUserEmail || "未ログイン"));
+    lines.push(
+      "  デッキ " + this.state.decks.length + " / カード " + this.state.cards.length +
+        "  最終同期 " + (localStorage.getItem("kioku.sync.at") || "なし") +
+        "  基準 " + (this.syncBase() ? "あり" : "なし") +
+        "  未送信 " + (this.hasLocalChanges() ? "あり" : "なし")
+    );
     this.setState({ syncBusy: true, syncError: lines.join("\n") + "\n診断中…" });
+    // クラウドに今なにが入っているかを直接見ます。端末側との食い違いはここで分かります。
+    if (this._syncUserEmail) {
+      try {
+        const sb = await this.loadSb();
+        const { data: u } = await sb.auth.getUser();
+        const { data, error } = await sb
+          .from("kioku_state")
+          .select("data, updated_at")
+          .eq("user_id", u.user.id)
+          .maybeSingle();
+        if (error) throw error;
+        if (!data) lines.push("クラウド  まだ何も入っていません");
+        else {
+          const d = data.data || {};
+          lines.push("クラウド  更新 " + data.updated_at);
+          lines.push(
+            "  デッキ " + ((d.decks || []).length) + " / カード " + ((d.cards || []).length) +
+              "  [" + (d.decks || []).map((x) => x.name).slice(0, 6).join(" / ") + "]"
+          );
+        }
+      } catch (e) {
+        lines.push("クラウド  読めません：" + String((e && e.message) || e).slice(0, 120));
+      }
+      lines.push("");
+      this.setState({ syncError: lines.join("\n") });
+    }
     for (let i = 0; i < SB_SOURCES.length; i++) {
       const src = SB_SOURCES[i];
       const where = new URL(src).hostname + (src.indexOf("+esm") >= 0 ? "(+esm)" : "");
@@ -938,10 +978,11 @@ class App extends Component {
   }
 
   async initSync() {
-    if (!this.cfg()) {
+    if (!this.cfg() || this._initializing) {
       this.setState({ booting: false });
       return;
     }
+    this._initializing = true;
     try {
       const sb = await this.loadSb();
       const { data } = await sb.auth.getSession();
@@ -967,6 +1008,8 @@ class App extends Component {
       // 復元するセッションが無いなら、まだ何もしていない人にエラーを見せる必要はありません。
       // 実際に困るのはログインを押したときで、そこで同じエラーが出ます。
       this.setState({ syncError: this._hadStoredSession ? this.errText(e) : null, booting: false });
+    } finally {
+      this._initializing = false;
     }
   }
 
