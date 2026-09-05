@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v26";
+const BUILD = "v27";
 
 const C = {
   bg: "#F3EFE6",
@@ -247,6 +247,100 @@ function stripSample(data) {
   return { data: next, changed: true };
 }
 
+// ---------------------------------------------------------------- 同期のマージ
+
+// 2つの端末が同じ行を別々に書き換えたときに、両方の変更を1つにまとめます。
+// base は「最後に同期できた内容」（localStorage の kioku.sync.base）。
+// base・こちら・あちらの3つを比べることで、**片方で削除した**のと
+// **片方にまだ届いていない**のを区別できます。base が無いときは削除の判定が
+// できないので、消さずに両方を残す側に倒します。
+
+// id で突き合わせて1つのリストにします。pick は両方に残っているときの選び方。
+function mergeList(base, local, remote, pick) {
+  const index = (a) => {
+    const m = {};
+    (a || []).forEach((x) => {
+      if (x && x.id) m[x.id] = x;
+    });
+    return m;
+  };
+  const B = index(base);
+  const L = index(local);
+  const R = index(remote);
+  const out = [];
+  const seen = {};
+  (local || []).concat(remote || []).forEach((x) => {
+    if (!x || !x.id || seen[x.id]) return;
+    seen[x.id] = 1;
+    const l = L[x.id];
+    const r = R[x.id];
+    if (l && r) out.push(pick(B[x.id], l, r));
+    else if (!B[x.id]) out.push(l || r); // どちらかで新しく追加された
+    // base にあって片側から消えている＝その端末で削除された。何も入れない
+  });
+  return out;
+}
+
+// デッキは名前を変えた方を採ります（進み具合のような概念が無いため）。
+function pickDeck(b, l, r) {
+  if (!b) return l;
+  return JSON.stringify(l) === JSON.stringify(b) ? r : l;
+}
+
+// カードは**学習の進み具合と文言を別々に**判断します。
+// 進み具合は進んでいる方（reps は単調に増えます）。文言は base から変えた方。
+// 一緒くたに新しい方を採ると、片方で復習しただけで他方の文字修正が消えます。
+function pickCard(b, l, r) {
+  const prog = (x) => [x.reps || 0, x.interval || 0, x.due || 0];
+  const lp = prog(l);
+  const rp = prog(r);
+  let winner = r;
+  for (let i = 0; i < lp.length; i++) {
+    if (lp[i] !== rp[i]) {
+      winner = lp[i] > rp[i] ? l : r;
+      break;
+    }
+  }
+  const text = (x) => [x.front, x.back, x.hint || "", x.deckId].join("\u0000");
+  let src = winner;
+  if (b) {
+    if (text(l) !== text(b)) src = l;
+    else if (text(r) !== text(b)) src = r;
+  }
+  return Object.assign({}, winner, { front: src.front, back: src.back, hint: src.hint, deckId: src.deckId });
+}
+
+// 学習枚数や評価の累計は、両方の端末で増えた分を足します（l + r - base）。
+// 単純に大きい方を採ると、同じ日に両方で学習した分が片方ぶん消えます。
+function mergeCounts(base, local, remote) {
+  const keys = {};
+  [base, local, remote].forEach((m) => {
+    Object.keys(m || {}).forEach((k) => {
+      keys[k] = 1;
+    });
+  });
+  const out = {};
+  Object.keys(keys).forEach((k) => {
+    const b = (base && base[k]) || 0;
+    const l = (local && local[k]) || 0;
+    const r = (remote && remote[k]) || 0;
+    out[k] = Math.max(l, r, l + r - b);
+  });
+  return out;
+}
+
+function mergePayload(base, local, remote) {
+  const b = base || {};
+  const log = mergeCounts(b.log, local.log, remote.log);
+  return {
+    decks: mergeList(b.decks, local.decks, remote.decks, pickDeck),
+    cards: alignDues(mergeList(b.cards, local.cards, remote.cards, pickCard)),
+    log: log,
+    gradeTotals: mergeCounts(b.gradeTotals, local.gradeTotals, remote.gradeTotals),
+    todayCount: log[dayKey(Date.now())] || 0,
+  };
+}
+
 // ---------------------------------------------------------------- アプリ本体
 
 class App extends Component {
@@ -395,9 +489,13 @@ class App extends Component {
       if (this.canSyncNow()) this.pull(true);
     };
     window.addEventListener("online", this._online);
-    // 送りそこねた分（オフライン・失敗・学習中の競合）を定期的に送り直します。
+    // 定期的に見直します。送りそこねた分（オフライン・失敗・学習中の競合）を送り直し、
+    // 送るものが無ければ相手の変更を取りに行きます。開きっぱなしの端末は
+    // visibilitychange が起きないので、これが唯一の取り込みの機会になります。
     this._syncTimer = setInterval(() => {
-      if (this._pushPending && this.canSyncNow()) this.flushPush();
+      if (!this.canSyncNow()) return;
+      if (this._pushPending) this.flushPush();
+      else if (document.visibilityState === "visible") this.pull(true);
     }, 60000);
 
     const c = this.cfg();
@@ -942,6 +1040,7 @@ class App extends Component {
     this._syncUserEmail = null;
     this._pushPending = false;
     clearTimeout(this._pushT);
+    localStorage.removeItem("kioku.sync.base");
     this.setState({ syncUser: null, syncAt: null, localOnly: false, syncPw: "", syncError: null, screen: "login" });
     localStorage.removeItem("kioku.localonly");
     this.toast("ログアウトしました");
@@ -950,6 +1049,30 @@ class App extends Component {
   payload() {
     const s = this.state;
     return { decks: s.decks, cards: s.cards, log: s.log, gradeTotals: s.gradeTotals, todayCount: s.todayCount };
+  }
+
+  // 最後にクラウドと一致した内容。競合したときの突き合わせの基準になります。
+  syncBase() {
+    try {
+      return JSON.parse(localStorage.getItem("kioku.sync.base") || "null");
+    } catch (e) {
+      return null;
+    }
+  }
+
+  setSyncBase(p) {
+    try {
+      localStorage.setItem("kioku.sync.base", JSON.stringify(p));
+    } catch (e) {} // 容量が足りないだけなら、次の競合で base 無しとして扱われます
+  }
+
+  // まだクラウドに送っていない変更があるか。base と中身を比べて判断します。
+  // _pushPending は再読み込みで消えるので、オフラインで編集したまま閉じた分を
+  // 取りこぼさないよう、こちらを送信の判断に使います。
+  hasLocalChanges() {
+    const base = this.syncBase();
+    if (!base) return true;
+    return JSON.stringify(this.payload()) !== JSON.stringify(base);
   }
 
   // force を渡したときだけ、クラウドの内容を確かめずに上書きします
@@ -963,23 +1086,27 @@ class App extends Component {
       const sb = await this.loadSb();
       const { data: u } = await sb.auth.getUser();
       // 書く前にクラウド側の更新時刻を確かめます。前回見た時刻より新しければ、別の端末が
-      // 先に書いています。そのまま upsert すると1行まるごと置き換わって相手の学習が消えるので、
-      // こちらは書かずに取り込み側へ回ります。
-      const cur = await sb.from("kioku_state").select("updated_at").eq("user_id", u.user.id).maybeSingle();
+      // 先に書いています。そのまま upsert すると1行まるごと置き換わって相手の学習が消えます。
+      const cur = await sb.from("kioku_state").select("data, updated_at").eq("user_id", u.user.id).maybeSingle();
       if (cur.error) throw cur.error;
       const remoteAt = cur.data ? cur.data.updated_at : null;
       const remoteMs = remoteAt ? new Date(remoteAt).getTime() : 0;
       const seenAt = localStorage.getItem("kioku.sync.at");
       const conflict = !!remoteAt && (!seenAt || remoteMs > new Date(seenAt).getTime());
+      let body = this.payload();
       if (conflict && !force) {
-        this._pushPending = true;
-        this._pushing = false; // 取り込みの中から送信が呼べるよう、先に外します
-        this.setState({ syncBusy: false });
-        if (this.canSyncNow()) {
-          await this.pull(true);
-          this.toast("別の端末の変更を取り込みました");
+        // 学習中は画面を作り替えられないので、送るのを次の機会まで待ちます。
+        // 手元の変更は localStorage に残ったままなので失われません。
+        if (!this.canSyncNow()) {
+          this._pushPending = true;
+          this.setState({ syncBusy: false });
+          return;
         }
-        return;
+        // 相手の内容と突き合わせて1つにまとめます。**どちらの変更も捨てません。**
+        body = mergePayload(this.syncBase(), body, stripSample(cur.data.data || {}).data);
+        this.setState(Object.assign({}, body, { syncBusy: true }));
+        this.persistLocal(body);
+        this.toast("別の端末の変更と統合しました");
       }
       // 端末の時計が遅れていても、クラウドにある時刻より必ず新しい値を書きます。
       // ここを素の Date.now() に戻すと、時計が数分ずれた端末どうしで新旧の判定が
@@ -987,9 +1114,10 @@ class App extends Component {
       const at = new Date(Math.max(Date.now(), remoteMs + 1000)).toISOString();
       const { error } = await sb
         .from("kioku_state")
-        .upsert({ user_id: u.user.id, data: this.payload(), updated_at: at });
+        .upsert({ user_id: u.user.id, data: body, updated_at: at });
       if (error) throw error;
       localStorage.setItem("kioku.sync.at", at);
+      this.setSyncBase(body);
       this._pushPending = false;
       this.setState({ syncBusy: false, syncAt: at });
     } catch (e) {
@@ -1043,12 +1171,17 @@ class App extends Component {
         localStorage.setItem("kioku.sync.at", data.updated_at);
         // 取り込んだ内容をそのまま押し戻さないよう、persist ではなく persistLocal を使います。
         this.persistLocal(next);
+        this.setSyncBase(next);
         this._pushPending = false;
         clearTimeout(this._pushT);
         if (!silent) this.toast("クラウドから復元しました");
       } else {
+        if (data.data) this.setSyncBase(stripSample(data.data).data);
         this.setState({ syncBusy: false });
-        await this.push();
+        // 送るものが無いなら書きません。ここで毎回書くと updated_at だけが進み、
+        // 別の端末から見て「誰かが先に書いた」ことになって偽の競合を起こします
+        // （相手がアプリを開き直しただけで、こちらの追加が競合扱いになっていました）。
+        if (this.hasLocalChanges() || !silent) await this.push();
         if (!silent) this.toast("この端末のデータをアップロードしました");
       }
     } catch (e) {
@@ -1111,6 +1244,7 @@ class App extends Component {
   clearCfg() {
     localStorage.removeItem("kioku.sync.cfg");
     localStorage.removeItem("kioku.sync.at");
+    localStorage.removeItem("kioku.sync.base");
     this._sbClient = null;
     this._syncUserEmail = null;
     this._pushPending = false;
@@ -3729,7 +3863,8 @@ class App extends Component {
                 </div>
                 <div style=${{ fontSize: 12, color: C.muted, lineHeight: 1.7, background: C.field, borderRadius: 12, padding: "12px 14px" }}>
                   学習するたび自動でアップロードされます。アプリを閉じるときにも送るので、学習の直後に切り替えても取りこぼしません。
-                  別の端末の変更は、ログインしたときと画面に戻ってきたときに取り込まれます（学習中は取り込みません）。
+                  別の端末の変更は、ログイン時・画面に戻ったとき・1分ごとに取り込まれます（学習中は取り込みません）。
+                  同時に別々の端末で変更したときは、両方の変更をまとめます。
                 </div>
                 <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <button style=${primary} onClick=${() => this.pull(false)}>今すぐ同期</button>
