@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v30";
+const BUILD = "v31";
 
 const C = {
   bg: "#F3EFE6",
@@ -40,13 +40,18 @@ const SB_SOURCES = [
 ];
 
 // 既定の保存先。ここに値を入れておくと、利用者は接続情報を貼らずメールとパスワードだけで始められます。
-// publishable key はブラウザに配られる公開キーで、実際の保護は kioku_state の RLS（SQL_SETUP）が担っています。
+// publishable key はブラウザに配られる公開キーで、実際の保護は kioku_items の RLS（SQL_SETUP）が担っています。
 // secret key は絶対に置かないこと。空のままなら、従来どおり画面から保存先を手入力します。
 const DEFAULT_SB = {
   url: "https://iakueghsgrcxcdsqtdxt.supabase.co",
   key: "sb_publishable_1s3ilko2FhbU2MbDi4KfBg_PMalXS4f",
 };
 
+// 同期の実体はカード・デッキ1件につき1行の kioku_items です。
+// 1行の JSON にまとめて入れていた頃は、別々のカードを触っただけで衝突し、
+// 「相手に無い」が削除なのか未着信なのか判別できませんでした。行に分け、
+// 削除を deleted_at で明示し、更新時刻をサーバに打たせることで、その3つを同時に解きます。
+// kioku_state は移行元としてだけ読みます（消さずに残す＝手動の逃げ道）。
 const SQL_SETUP = [
   "create table if not exists kioku_state (",
   "  user_id uuid primary key references auth.users on delete cascade,",
@@ -57,6 +62,38 @@ const SQL_SETUP = [
   'drop policy if exists "own rows" on kioku_state;',
   'create policy "own rows" on kioku_state',
   "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);",
+  "",
+  "-- ここから下が新しい同期用です。上と一緒にそのまま実行してください。",
+  "create table if not exists kioku_items (",
+  "  user_id uuid not null references auth.users on delete cascade,",
+  "  kind text not null,",
+  "  item_id text not null,",
+  "  data jsonb,",
+  "  deleted_at timestamptz,",
+  "  updated_at timestamptz not null default now(),",
+  "  primary key (user_id, kind, item_id)",
+  ");",
+  "",
+  "-- 更新時刻は必ずサーバが打ちます。端末の時計がずれていても順序が壊れません。",
+  "create or replace function kioku_touch() returns trigger as $$",
+  "begin",
+  "  new.updated_at = now();",
+  "  return new;",
+  "end $$ language plpgsql;",
+  "drop trigger if exists kioku_items_touch on kioku_items;",
+  "create trigger kioku_items_touch before insert or update on kioku_items",
+  "  for each row execute function kioku_touch();",
+  "",
+  "create index if not exists kioku_items_sync on kioku_items (user_id, updated_at);",
+  "alter table kioku_items enable row level security;",
+  'drop policy if exists "own rows" on kioku_items;',
+  'create policy "own rows" on kioku_items',
+  "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);",
+  "",
+  "-- 変更を他の端末へ即時に流すための購読設定（2回実行しても平気です）。",
+  "do $$ begin",
+  "  alter publication supabase_realtime add table kioku_items;",
+  "exception when duplicate_object then null; end $$;",
 ].join("\n");
 
 function dayKey(t) {
@@ -247,44 +284,45 @@ function stripSample(data) {
   return { data: next, changed: true };
 }
 
-// ---------------------------------------------------------------- 同期のマージ
+// ---------------------------------------------------------------- 同期に使う形
 
-// 2つの端末が同じ行を別々に書き換えたときに、両方の変更を1つにまとめます。
-// base は「最後に同期できた内容」（localStorage の kioku.sync.base）。
-// base・こちら・あちらの3つを比べることで、**片方で削除した**のと
-// **片方にまだ届いていない**のを区別できます。base が無いときは削除の判定が
-// できないので、消さずに両方を残す側に倒します。
-
-// id で突き合わせて1つのリストにします。pick は両方に残っているときの選び方。
-function mergeList(base, local, remote, pick) {
-  const index = (a) => {
-    const m = {};
-    (a || []).forEach((x) => {
-      if (x && x.id) m[x.id] = x;
-    });
-    return m;
-  };
-  const B = index(base);
-  const L = index(local);
-  const R = index(remote);
-  const out = [];
-  const seen = {};
-  (local || []).concat(remote || []).forEach((x) => {
-    if (!x || !x.id || seen[x.id]) return;
-    seen[x.id] = 1;
-    const l = L[x.id];
-    const r = R[x.id];
-    if (l && r) out.push(pick(B[x.id], l, r));
-    else if (!B[x.id]) out.push(l || r); // どちらかで新しく追加された
-    // base にあって片側から消えている＝その端末で削除された。何も入れない
-  });
-  return out;
+// 行に入れる中身。**ここを唯一の定義にしてください。** 送るときと、控えのハッシュを
+// 作るときで形がずれると、毎回「変わった」と誤判定して送り返しが止まりません。
+// 値を必ず埋めるのも同じ理由です（undefined と "" が混ざると形が安定しません）。
+function deckRow(d) {
+  return { name: d.name || "", sub: d.sub || "" };
 }
 
-// デッキは名前を変えた方を採ります（進み具合のような概念が無いため）。
-function pickDeck(b, l, r) {
-  if (!b) return l;
-  return JSON.stringify(l) === JSON.stringify(b) ? r : l;
+function cardRow(c) {
+  return {
+    deckId: c.deckId,
+    front: c.front || "",
+    back: c.back || "",
+    hint: c.hint || "",
+    ease: typeof c.ease === "number" ? c.ease : 2.5,
+    interval: c.interval || 0,
+    reps: c.reps || 0,
+    state: c.state || "new",
+    due: c.due || 0,
+  };
+}
+
+// キーの順に依存しない文字列化。Postgres の jsonb はキーの順を並べ替えて返すので、
+// 素の JSON.stringify で比べると、中身が同じでも「変わった」ことになってしまいます。
+function canon(v) {
+  if (v === null || v === undefined) return "null";
+  if (typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+  return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+}
+
+// 送信済みかどうかを覚えるための短い印。中身そのものを控えると、
+// 学習データと同じ量を localStorage に二重に置くことになります。
+function hashOf(v) {
+  const str = canon(v);
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+  return h.toString(36) + ":" + str.length.toString(36);
 }
 
 // カードは**学習の進み具合と文言を別々に**判断します。
@@ -312,60 +350,6 @@ function pickCard(b, l, r) {
 
 // 学習枚数や評価の累計は、両方の端末で増えた分を足します（l + r - base）。
 // 単純に大きい方を採ると、同じ日に両方で学習した分が片方ぶん消えます。
-function mergeCounts(base, local, remote) {
-  const keys = {};
-  [base, local, remote].forEach((m) => {
-    Object.keys(m || {}).forEach((k) => {
-      keys[k] = 1;
-    });
-  });
-  const out = {};
-  Object.keys(keys).forEach((k) => {
-    const b = (base && base[k]) || 0;
-    const l = (local && local[k]) || 0;
-    const r = (remote && remote[k]) || 0;
-    out[k] = Math.max(l, r, l + r - b);
-  });
-  return out;
-}
-
-function mergeCore(base, local, remote) {
-  const b = base || {};
-  const log = mergeCounts(b.log, local.log, remote.log);
-  return {
-    decks: mergeList(b.decks, local.decks, remote.decks, pickDeck),
-    cards: alignDues(mergeList(b.cards, local.cards, remote.cards, pickCard)),
-    log: log,
-    gradeTotals: mergeCounts(b.gradeTotals, local.gradeTotals, remote.gradeTotals),
-    todayCount: log[dayKey(Date.now())] || 0,
-  };
-}
-
-// 統合で手元のカードが大量に消える結果になったときの安全弁。
-// 壊れた版のアプリがクラウドを切り詰めると、正常な端末からは「別の端末で大量に削除した」
-// のと区別がつきません（実際に Service Worker が古い応答を返していた端末が、
-// 気づかないうちにクラウドを丸ごと上書きし、他の端末がそれを削除として追随しかけました）。
-// 数枚を消し直す手間より、数千枚が黙って消えない方を優先します。
-// 割合と枚数の両方を見るのは、数枚しかない人のふつうの削除まで止めないためです。
-const GUARD_MIN_CARDS = 20; // これ未満なら、ふつうの削除として扱います
-const GUARD_RATIO = 0.3; // 手元のカードのこの割合以上が消えるなら止めます
-
-// { data, guarded } を返します。guarded が真なら、削除を適用せず両方残しました。
-function mergePayload(base, local, remote) {
-  const merged = mergeCore(base, local, remote);
-  if (!base) return { data: merged, guarded: false };
-  const alive = {};
-  merged.cards.forEach((c) => {
-    alive[c.id] = 1;
-  });
-  const mine = local.cards || [];
-  const lost = mine.filter((c) => !alive[c.id]).length;
-  if (lost >= GUARD_MIN_CARDS && lost >= mine.length * GUARD_RATIO) {
-    // base を無かったことにすると、削除の判定が消えて「両方残す」になります。
-    return { data: mergeCore(null, local, remote), guarded: true };
-  }
-  return { data: merged, guarded: false };
-}
 
 // ---------------------------------------------------------------- アプリ本体
 
@@ -427,6 +411,7 @@ class App extends Component {
     localOnly: false, // 「この端末だけで使う」を選んだ
     authMode: "in", // ログイン画面のタブ "in" | "up"
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
+    sqlNeeded: false, // kioku_items がまだ無い（SQL 未実行）ので、SQL を出す
   };
 
   componentDidMount() {
@@ -549,6 +534,7 @@ class App extends Component {
     window.removeEventListener("pagehide", this._pageHide);
     window.removeEventListener("online", this._online);
     clearInterval(this._syncTimer);
+    this.unsubscribeRealtime();
     clearTimeout(this._toastT);
     clearTimeout(this._pushT);
   }
@@ -856,6 +842,26 @@ class App extends Component {
     if (this.state.localOnly) this.setState({ localOnly: false });
   }
 
+  // kioku_items がまだ無い＝SQL を実行していないとき。原因が分かる文言に差し替えます。
+  // PostgREST はテーブルが無いと PGRST205（schema cache に無い）を返します。
+  needsSetup(e) {
+    const m = String((e && (e.message || e.details || e.code)) || e);
+    return /kioku_items/.test(m) && /(does not exist|42P01|PGRST205|schema cache)/i.test(m);
+  }
+
+  syncFail(e) {
+    if (this.needsSetup(e)) {
+      this.setState({
+        sqlNeeded: true,
+        syncError:
+          "同期の準備がまだ終わっていません。この画面の下に出ているSQLを Supabase の SQL Editor で実行してください（kioku_items テーブルを作ります）。" +
+          "実行するまで、学習データはこの端末の中にだけ保存されます。消えることはありません。",
+      });
+      return;
+    }
+    this.setState({ syncError: this.errText(e) });
+  }
+
   // エラー文言に app.js のどの行で起きたかを添える（古い版が動いていないかの確認用）。
   errText(e) {
     const msg = String((e && e.message) || e);
@@ -885,8 +891,11 @@ class App extends Component {
     lines.push(
       "  デッキ " + this.state.decks.length + " / カード " + this.state.cards.length +
         "  最終同期 " + (localStorage.getItem("kioku.sync.at") || "なし") +
-        "  基準 " + (this.syncBase() ? "あり" : "なし") +
-        "  未送信 " + (this.hasLocalChanges() ? "あり" : "なし")
+        "  受信済み " + this.cursor() +
+        "  未送信 " + (function (x) {
+          return x.put.length + x.del.length;
+        })(this.pending()) + " 件" +
+        "  即時反映 " + (this._rt ? "接続" : "なし")
     );
     this.setState({ syncBusy: true, syncError: lines.join("\n") + "\n診断中…" });
     // クラウドに今なにが入っているかを直接見ます。端末側との食い違いはここで分かります。
@@ -895,20 +904,15 @@ class App extends Component {
         const sb = await this.loadSb();
         const { data: u } = await sb.auth.getUser();
         const { data, error } = await sb
-          .from("kioku_state")
-          .select("data, updated_at")
+          .from("kioku_items")
+          .select("kind, item_id, data, deleted_at")
           .eq("user_id", u.user.id)
-          .maybeSingle();
+          .is("deleted_at", null);
         if (error) throw error;
-        if (!data) lines.push("クラウド  まだ何も入っていません");
-        else {
-          const d = data.data || {};
-          lines.push("クラウド  更新 " + data.updated_at);
-          lines.push(
-            "  デッキ " + ((d.decks || []).length) + " / カード " + ((d.cards || []).length) +
-              "  [" + (d.decks || []).map((x) => x.name).slice(0, 6).join(" / ") + "]"
-          );
-        }
+        const rows = data || [];
+        const dk = rows.filter((r) => r.kind === "deck");
+        lines.push("クラウド  デッキ " + dk.length + " / カード " + rows.filter((r) => r.kind === "card").length);
+        lines.push("  [" + dk.map((r) => (r.data || {}).name).slice(0, 6).join(" / ") + "]");
       } catch (e) {
         lines.push("クラウド  読めません：" + String((e && e.message) || e).slice(0, 120));
       }
@@ -1019,10 +1023,14 @@ class App extends Component {
           if (u) {
             this.leaveLocalOnly();
             this.pull(true);
+            if (session && session.user) this.subscribeRealtime(sb, session.user.id);
           }
         });
       }
-      if (user) await this.pull(true);
+      if (user) {
+        await this.pull(true);
+        this.subscribeRealtime(sb, user.id);
+      }
     } catch (e) {
       // 復元するセッションが無いなら、まだ何もしていない人にエラーを見せる必要はありません。
       // 実際に困るのはログインを押したときで、そこで同じエラーが出ます。
@@ -1088,6 +1096,7 @@ class App extends Component {
       });
       this.toast("ログインしました");
       await this.pull(true);
+      this.subscribeRealtime(sb, data.session.user.id);
     } catch (e) {
       this.setState({ syncBusy: false, syncError: this.errText(e) });
     }
@@ -1102,101 +1111,264 @@ class App extends Component {
     this._syncUserEmail = null;
     this._pushPending = false;
     clearTimeout(this._pushT);
-    localStorage.removeItem("kioku.sync.base");
+    this.unsubscribeRealtime();
+    this.forgetSyncState();
     this.setState({ syncUser: null, syncAt: null, localOnly: false, syncPw: "", syncError: null, screen: "login" });
     localStorage.removeItem("kioku.localonly");
     this.toast("ログアウトしました");
   }
 
+  // JSON バックアップと移行で使う、全体をひとまとめにした形。
   payload() {
     const s = this.state;
     return { decks: s.decks, cards: s.cards, log: s.log, gradeTotals: s.gradeTotals, todayCount: s.todayCount };
   }
 
-  // 最後にクラウドと一致した内容。競合したときの突き合わせの基準になります。
-  syncBase() {
+  // ---- 同期（行ごと） ----
+  //
+  // カード・デッキは1件1行（kioku_items）。触った行だけを送り、前回以降に変わった行だけを取ります。
+  // 別々のカードを触っているかぎり、そもそも衝突しません。
+
+  // この端末の名札。学習枚数の集計で「誰がぶんか」を持つのに使います。
+  deviceId() {
+    let d = localStorage.getItem("kioku.sync.device");
+    if (!d) {
+      d = uid("dev");
+      localStorage.setItem("kioku.sync.device", d);
+    }
+    return d;
+  }
+
+  // 前回どこまで取り込んだか（サーバの updated_at）。ここから先だけを取りに行きます。
+  cursor() {
+    return localStorage.getItem("kioku.sync.cursor") || "1970-01-01T00:00:00Z";
+  }
+
+  // 送信済みの内容を覚えておく控え。中身そのものではなく短いハッシュだけを持ちます
+  // （4000枚あっても100KB程度。学習データと同じ量を二重に置くと容量が足りません）。
+  shadow() {
     try {
-      return JSON.parse(localStorage.getItem("kioku.sync.base") || "null");
+      return JSON.parse(localStorage.getItem("kioku.sync.shadow") || "{}") || {};
     } catch (e) {
-      return null;
+      return {};
     }
   }
 
-  setSyncBase(p) {
+  setShadow(sh) {
     try {
-      localStorage.setItem("kioku.sync.base", JSON.stringify(p));
-    } catch (e) {} // 容量が足りないだけなら、次の競合で base 無しとして扱われます
+      localStorage.setItem("kioku.sync.shadow", JSON.stringify(sh));
+    } catch (e) {}
   }
 
-  // まだクラウドに送っていない変更があるか。base と中身を比べて判断します。
-  // _pushPending は再読み込みで消えるので、オフラインで編集したまま閉じた分を
-  // 取りこぼさないよう、こちらを送信の判断に使います。
-  hasLocalChanges() {
-    const base = this.syncBase();
-    if (!base) return true;
-    return JSON.stringify(this.payload()) !== JSON.stringify(base);
+  // 受け取った学習枚数・評価の行（端末ごと＋移行時の legacy）。合計はここから作ります。
+  counts() {
+    try {
+      return JSON.parse(localStorage.getItem("kioku.sync.counts") || "{}") || {};
+    } catch (e) {
+      return {};
+    }
   }
 
-  // force を渡したときだけ、クラウドの内容を確かめずに上書きします
-  // （同期画面の「この端末の内容で上書き」用）。
-  async push(force) {
-    if (!this._syncUserEmail || this._pushing) return;
-    clearTimeout(this._pushT);
-    this._pushing = true;
-    this.setState({ syncBusy: true, syncError: null });
+  setCounts(c) {
     try {
-      const sb = await this.loadSb();
-      const { data: u } = await sb.auth.getUser();
-      // 書く前にクラウド側の更新時刻を確かめます。前回見た時刻より新しければ、別の端末が
-      // 先に書いています。そのまま upsert すると1行まるごと置き換わって相手の学習が消えます。
-      const cur = await sb.from("kioku_state").select("data, updated_at").eq("user_id", u.user.id).maybeSingle();
-      if (cur.error) throw cur.error;
-      const remoteAt = cur.data ? cur.data.updated_at : null;
-      const remoteMs = remoteAt ? new Date(remoteAt).getTime() : 0;
-      const seenAt = localStorage.getItem("kioku.sync.at");
-      const conflict = !!remoteAt && (!seenAt || remoteMs > new Date(seenAt).getTime());
-      let body = this.payload();
-      if (conflict && !force) {
-        // 学習中は画面を作り替えられないので、送るのを次の機会まで待ちます。
-        // 手元の変更は localStorage に残ったままなので失われません。
-        if (!this.canSyncNow()) {
-          this._pushPending = true;
-          this.setState({ syncBusy: false });
-          return;
-        }
-        // 相手の内容と突き合わせて1つにまとめます。**どちらの変更も捨てません。**
-        const m = mergePayload(this.syncBase(), body, stripSample(cur.data.data || {}).data);
-        body = m.data;
-        this.setState(Object.assign({}, body, { syncBusy: true }));
-        this.persistLocal(body);
-        this.toast(
-          m.guarded
-            ? "差が大きいため、消さずに両方の内容を残しました"
-            : "別の端末の変更と統合しました"
-        );
+      localStorage.setItem("kioku.sync.counts", JSON.stringify(c));
+    } catch (e) {}
+  }
+
+  // 同期が見る「いまの手元の内容」は、**state ではなく localStorage から読みます。**
+  // Preact の setState は次の描画まで this.state を書き換えないので、取り込んだ直後に
+  // state を見ると中身が空のままです。そこで差分を取ると全項目が「消された」ことになり、
+  // 墓標を送ってクラウドを空にしてしまいます（実際にそうなりました）。
+  // persist / persistLocal は同期的に書くので、localStorage は常に最新です。
+  savedData() {
+    try {
+      const d = JSON.parse(localStorage.getItem("kioku.mvp.v1") || "null");
+      if (d && d.decks && d.cards) return d;
+    } catch (e) {}
+    return { decks: this.state.decks, cards: this.state.cards, log: this.state.log, gradeTotals: this.state.gradeTotals };
+  }
+
+  // いま手元にある項目を「行の中身」の形で並べます。
+  localRows() {
+    const d = this.savedData();
+    const out = {};
+    (d.decks || []).forEach((x) => {
+      out["deck:" + x.id] = deckRow(x);
+    });
+    (d.cards || []).forEach((c) => {
+      out["card:" + c.id] = cardRow(c);
+    });
+    return out;
+  }
+
+  // まだ送っていない差分。控えと突き合わせて、増えた・変わった・消えたを出します。
+  // 消えたものは行を消さず deleted_at を立てます。**行を消すと「削除した」のか
+  // 「まだ届いていない」のかが二度と分からなくなります。**
+  pending() {
+    const now = this.localRows();
+    const sh = this.shadow();
+    const put = [];
+    const del = [];
+    Object.keys(now).forEach((k) => {
+      const h = hashOf(now[k]);
+      if (sh[k] !== h) put.push({ key: k, data: now[k], hash: h });
+    });
+    Object.keys(sh).forEach((k) => {
+      if (sh[k] !== "-" && !now[k]) del.push({ key: k });
+    });
+    return { put, del };
+  }
+
+  // 学習枚数と評価の累計は端末ごとに1行持ち、表示は全部の合計にします。
+  // 「この端末のぶん」は 合計 −（他の端末＋legacy）で出せるので、
+  // 学習のたびに別途カウンタを触る必要がありません。
+  myCounts() {
+    const c = this.counts();
+    const me = this.deviceId();
+    const otherLog = {};
+    const otherGrade = { again: 0, hard: 0, good: 0, easy: 0 };
+    Object.keys(c).forEach((k) => {
+      if (k === "log:" + me || k === "grade:" + me) return;
+      const v = c[k] || {};
+      if (k.indexOf("log:") === 0) {
+        Object.keys(v).forEach((day) => {
+          otherLog[day] = (otherLog[day] || 0) + (v[day] || 0);
+        });
+      } else if (k.indexOf("grade:") === 0) {
+        Object.keys(otherGrade).forEach((g) => {
+          otherGrade[g] += v[g] || 0;
+        });
       }
-      // 端末の時計が遅れていても、クラウドにある時刻より必ず新しい値を書きます。
-      // ここを素の Date.now() に戻すと、時計が数分ずれた端末どうしで新旧の判定が
-      // ひっくり返り、遅れている側の学習が黙って消えます。
-      const at = new Date(Math.max(Date.now(), remoteMs + 1000)).toISOString();
-      const { error } = await sb
-        .from("kioku_state")
-        .upsert({ user_id: u.user.id, data: body, updated_at: at });
-      if (error) throw error;
-      localStorage.setItem("kioku.sync.at", at);
-      this.setSyncBase(body);
-      this._pushPending = false;
-      this.setState({ syncBusy: false, syncAt: at });
-    } catch (e) {
-      // 送れなかった分は覚えておいて、復帰時・回線復活時・定期の見直しで送り直します。
-      this._pushPending = true;
-      this.setState({ syncBusy: false, syncError: this.errText(e) });
-    } finally {
-      this._pushing = false;
-    }
+    });
+    const saved = this.savedData();
+    const log = {};
+    const total = saved.log || {};
+    Object.keys(total).forEach((day) => {
+      const n = (total[day] || 0) - (otherLog[day] || 0);
+      if (n > 0) log[day] = n;
+    });
+    const grade = {};
+    const gt = saved.gradeTotals || {};
+    Object.keys(otherGrade).forEach((g) => {
+      grade[g] = Math.max(0, (gt[g] || 0) - otherGrade[g]);
+    });
+    return { log, grade };
   }
 
-  // 競合は updated_at が新しい方を採用（last-write-wins）
+  // 受け取った学習枚数の行から、表示用の合計を作り直します。
+  recount(counts) {
+    const log = {};
+    const gradeTotals = { again: 0, hard: 0, good: 0, easy: 0 };
+    Object.keys(counts).forEach((k) => {
+      const v = counts[k] || {};
+      if (k.indexOf("log:") === 0) {
+        Object.keys(v).forEach((day) => {
+          log[day] = (log[day] || 0) + (v[day] || 0);
+        });
+      } else if (k.indexOf("grade:") === 0) {
+        Object.keys(gradeTotals).forEach((g) => {
+          gradeTotals[g] += v[g] || 0;
+        });
+      }
+    });
+    return { log, gradeTotals, todayCount: log[dayKey(Date.now())] || 0 };
+  }
+
+  // 受け取った行を手元に反映します。realtime からも同じ入口を通します。
+  // advance は「ここまで受け取った」の印（cursor）を進めてよいか。
+  // **realtime では進めません。** 届いた行より古い、まだ取っていない行があると、
+  // 印だけ先に進んで、その行を永久に取りこぼします。realtime は表示を早めるだけにして、
+  // 取りこぼしの防止は差分取得（pull）に任せます。同じ行を二度反映しても害はありません。
+  applyRows(rows, advance) {
+    if (!rows || !rows.length) return false;
+    const saved = this.savedData();
+    const decks = (saved.decks || []).slice();
+    const cards = (saved.cards || []).slice();
+    const dIdx = {};
+    decks.forEach((d, i) => {
+      dIdx[d.id] = i;
+    });
+    const cIdx = {};
+    cards.forEach((c, i) => {
+      cIdx[c.id] = i;
+    });
+    const sh = this.shadow();
+    const counts = this.counts();
+    const pend = this.pending();
+    const dirty = {};
+    pend.put.forEach((x) => {
+      dirty[x.key] = 1;
+    });
+    pend.del.forEach((x) => {
+      dirty[x.key] = 1;
+    });
+    let cursor = this.cursor();
+    let countsChanged = false;
+
+    rows.forEach((r) => {
+      if (r.updated_at > cursor) cursor = r.updated_at;
+      const key = r.kind + ":" + r.item_id;
+      if (r.kind === "log" || r.kind === "grade") {
+        counts[key] = r.deleted_at ? {} : r.data || {};
+        countsChanged = true;
+        return;
+      }
+      if (r.kind !== "deck" && r.kind !== "card") return;
+      // こちらで触ったまま送れていない項目は、相手の内容で潰しません。
+      // カードは学習の進み具合だけ進んでいる方を採り、文言はこちらを残します。
+      if (dirty[key]) {
+        if (r.kind === "card" && !r.deleted_at && cIdx[r.item_id] !== undefined) {
+          const mine = cards[cIdx[r.item_id]];
+          const theirs = Object.assign({ id: r.item_id }, r.data);
+          cards[cIdx[r.item_id]] = pickCard(null, mine, theirs);
+        }
+        return;
+      }
+      if (r.deleted_at) {
+        if (r.kind === "deck" && dIdx[r.item_id] !== undefined) decks[dIdx[r.item_id]] = null;
+        if (r.kind === "card" && cIdx[r.item_id] !== undefined) cards[cIdx[r.item_id]] = null;
+        sh[key] = "-"; // 墓標。もう手元に無いが、削除済みだと分かる印
+        return;
+      }
+      const item = Object.assign({ id: r.item_id }, r.data);
+      if (r.kind === "deck") {
+        if (dIdx[r.item_id] === undefined) {
+          dIdx[r.item_id] = decks.length;
+          decks.push(item);
+        } else decks[dIdx[r.item_id]] = item;
+      } else {
+        if (cIdx[r.item_id] === undefined) {
+          cIdx[r.item_id] = cards.length;
+          cards.push(item);
+        } else cards[cIdx[r.item_id]] = item;
+      }
+      sh[key] = hashOf(r.data);
+    });
+
+    const nextDecks = decks.filter(Boolean);
+    const nextCards = alignDues(cards.filter(Boolean));
+    const next = { decks: nextDecks, cards: nextCards };
+    if (countsChanged) {
+      this.setCounts(counts);
+      Object.assign(next, this.recount(counts));
+    }
+    // 取り込みで消えたカードが出題キューに残らないようにします。
+    const alive = {};
+    nextCards.forEach((c) => {
+      alive[c.id] = 1;
+    });
+    const queue = this.state.queue.filter((id) => alive[id]);
+    this.setShadow(sh);
+    if (advance) {
+      localStorage.setItem("kioku.sync.cursor", cursor);
+      localStorage.setItem("kioku.sync.at", cursor);
+    }
+    this.setState(Object.assign({}, next, { queue }, advance ? { syncAt: cursor } : {}));
+    this.persistLocal(next);
+    return true;
+  }
+
+  // 前回以降に変わった行だけを取りに行きます。
   async pull(silent) {
     if (!this._syncUserEmail || this._pulling) return;
     this._pulling = true;
@@ -1204,58 +1376,190 @@ class App extends Component {
     try {
       const sb = await this.loadSb();
       const { data: u } = await sb.auth.getUser();
-      const { data, error } = await sb
-        .from("kioku_state")
-        .select("data, updated_at")
-        .eq("user_id", u.user.id)
-        .maybeSingle();
-      if (error) throw error;
-      if (!data) {
-        // クラウドにまだ何もないので、この端末の内容で作ります。
-        this.setState({ syncBusy: false });
-        await this.push();
-        return;
+      await this.migrateLegacy(sb, u.user.id);
+      let from = this.cursor();
+      let got = 0;
+      // 1回で取り切れないほど溜まっていることがあるので、続きがある限り繰り返します。
+      for (let round = 0; round < 40; round++) {
+        const { data, error } = await sb
+          .from("kioku_items")
+          .select("kind, item_id, data, deleted_at, updated_at")
+          .eq("user_id", u.user.id)
+          .gt("updated_at", from)
+          .order("updated_at", { ascending: true })
+          .limit(1000);
+        if (error) throw error;
+        if (!data || !data.length) break;
+        this.applyRows(data, true);
+        got += data.length;
+        const last = data[data.length - 1].updated_at;
+        if (last === from || data.length < 1000) break;
+        from = last;
       }
-      const localAt = localStorage.getItem("kioku.sync.at");
-      const remoteNewer = !localAt || new Date(data.updated_at) > new Date(localAt);
-      if (remoteNewer && data.data) {
-        // クラウド側に古い版のサンプルデータが残っていることがあるので、ここでも取り除きます。
-        const d = stripSample(data.data).data;
-        const next = {
-          decks: d.decks || [],
-          cards: alignDues(d.cards),
-          log: d.log || {},
-          gradeTotals: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
-          todayCount: (d.log && d.log[dayKey(Date.now())]) || 0,
-        };
-        // 取り込みで消えたカードが出題キューに残らないようにします。
-        const alive = {};
-        next.cards.forEach((c) => {
-          alive[c.id] = 1;
-        });
-        const queue = this.state.queue.filter((id) => alive[id]);
-        this.setState(Object.assign({}, next, { queue, syncBusy: false, syncAt: data.updated_at }));
-        localStorage.setItem("kioku.sync.at", data.updated_at);
-        // 取り込んだ内容をそのまま押し戻さないよう、persist ではなく persistLocal を使います。
-        this.persistLocal(next);
-        this.setSyncBase(next);
-        this._pushPending = false;
-        clearTimeout(this._pushT);
-        if (!silent) this.toast("クラウドから復元しました");
-      } else {
-        if (data.data) this.setSyncBase(stripSample(data.data).data);
-        this.setState({ syncBusy: false });
-        // 送るものが無いなら書きません。ここで毎回書くと updated_at だけが進み、
-        // 別の端末から見て「誰かが先に書いた」ことになって偽の競合を起こします
-        // （相手がアプリを開き直しただけで、こちらの追加が競合扱いになっていました）。
-        if (this.hasLocalChanges() || !silent) await this.push();
-        if (!silent) this.toast("この端末のデータをアップロードしました");
-      }
+      this.setState({ syncBusy: false });
+      if (!silent) this.toast(got ? "最新の状態にしました" : "変更はありませんでした");
+      await this.push();
     } catch (e) {
-      this.setState({ syncBusy: false, syncError: this.errText(e) });
+      this.setState({ syncBusy: false });
+      this.syncFail(e);
     } finally {
       this._pulling = false;
     }
+  }
+
+  // 触った行だけを送ります。行ごとなので、他の端末の別の行とはぶつかりません。
+  async push(force) {
+    if (!this._syncUserEmail || this._pushing) return;
+    clearTimeout(this._pushT);
+    this._pushing = true;
+    try {
+      const pend = this.pending();
+      const mine = this.myCounts();
+      const counts = this.counts();
+      const me = this.deviceId();
+      // 比較は canon で。素の JSON.stringify だと、サーバから戻ってきた行はキーの順が
+      // 並べ替わっているため、中身が同じでも毎回「変わった」ことになります。
+      const logChanged = canon(counts["log:" + me] || {}) !== canon(mine.log);
+      const gradeChanged = canon(counts["grade:" + me] || {}) !== canon(mine.grade);
+      if (!force && !pend.put.length && !pend.del.length && !logChanged && !gradeChanged) {
+        this._pushPending = false;
+        this._pushing = false;
+        return;
+      }
+      this.setState({ syncBusy: true, syncError: null });
+      const sb = await this.loadSb();
+      const { data: u } = await sb.auth.getUser();
+      const uid2 = u.user.id;
+      const rows = [];
+      pend.put.forEach((x) => {
+        const i = x.key.indexOf(":");
+        rows.push({ user_id: uid2, kind: x.key.slice(0, i), item_id: x.key.slice(i + 1), data: x.data, deleted_at: null });
+      });
+      pend.del.forEach((x) => {
+        const i = x.key.indexOf(":");
+        rows.push({
+          user_id: uid2,
+          kind: x.key.slice(0, i),
+          item_id: x.key.slice(i + 1),
+          data: null,
+          deleted_at: new Date().toISOString(),
+        });
+      });
+      if (logChanged) rows.push({ user_id: uid2, kind: "log", item_id: me, data: mine.log, deleted_at: null });
+      if (gradeChanged) rows.push({ user_id: uid2, kind: "grade", item_id: me, data: mine.grade, deleted_at: null });
+
+      // updated_at は送りません。サーバのトリガが打ちます（端末の時計に依存しないため）。
+      for (let i = 0; i < rows.length; i += 400) {
+        const { error } = await sb.from("kioku_items").upsert(rows.slice(i, i + 400), { onConflict: "user_id,kind,item_id" });
+        if (error) throw error;
+      }
+
+      const sh = this.shadow();
+      pend.put.forEach((x) => {
+        sh[x.key] = x.hash;
+      });
+      pend.del.forEach((x) => {
+        sh[x.key] = "-";
+      });
+      this.setShadow(sh);
+      if (logChanged) counts["log:" + me] = mine.log;
+      if (gradeChanged) counts["grade:" + me] = mine.grade;
+      if (logChanged || gradeChanged) this.setCounts(counts);
+      const at = new Date().toISOString();
+      localStorage.setItem("kioku.sync.at", at);
+      this._pushPending = false;
+      this.setState({ syncBusy: false, syncAt: at });
+    } catch (e) {
+      this._pushPending = true;
+      this.setState({ syncBusy: false });
+      this.syncFail(e);
+    } finally {
+      this._pushing = false;
+    }
+  }
+
+  // 1行 JSON だった頃の kioku_state を、行に移します。
+  // **消さずに残します。** 移行がうまくいかなかったときの逃げ道になるのと、
+  // まだ更新していない端末が書き込んだ分をここから拾えるためです。
+  async migrateLegacy(sb, userId) {
+    try {
+      const { data, error } = await sb
+        .from("kioku_state")
+        .select("data, updated_at")
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (error || !data || !data.data) return;
+      const done = localStorage.getItem("kioku.sync.legacy") || "";
+      if (done >= data.updated_at) return;
+      const d = stripSample(data.data).data;
+      const rows = [];
+      (d.decks || []).forEach((x) => {
+        rows.push({ user_id: userId, kind: "deck", item_id: x.id, data: deckRow(x), deleted_at: null });
+      });
+      alignDues(d.cards).forEach((c) => {
+        rows.push({ user_id: userId, kind: "card", item_id: c.id, data: cardRow(c), deleted_at: null });
+      });
+      // 学習枚数は legacy という1行にまとめます。端末ごとに持たせると、
+      // どの端末も同じ履歴を「自分のぶん」と主張して二重に数えます。
+      rows.push({ user_id: userId, kind: "log", item_id: "legacy", data: d.log || {}, deleted_at: null });
+      rows.push({
+        user_id: userId,
+        kind: "grade",
+        item_id: "legacy",
+        data: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
+        deleted_at: null,
+      });
+      // すでに行がある項目は上書きしません（消したものが生き返らないように）。
+      const { data: have, error: e2 } = await sb.from("kioku_items").select("kind, item_id").eq("user_id", userId);
+      if (e2) throw e2;
+      const known = {};
+      (have || []).forEach((r) => {
+        known[r.kind + ":" + r.item_id] = 1;
+      });
+      const fresh = rows.filter((r) => !known[r.kind + ":" + r.item_id]);
+      for (let i = 0; i < fresh.length; i += 400) {
+        const { error: e3 } = await sb.from("kioku_items").upsert(fresh.slice(i, i + 400), { onConflict: "user_id,kind,item_id" });
+        if (e3) throw e3;
+      }
+      localStorage.setItem("kioku.sync.legacy", data.updated_at);
+    } catch (e) {
+      // 移行できなくても、行の同期そのものは動きます。次回また試します。
+    }
+  }
+
+  // 変更を待たずに受け取ります。届いた行はそのまま applyRows に流します。
+  async subscribeRealtime(sb, userId) {
+    if (this._rt || !sb.channel) return;
+    try {
+      this._rt = sb
+        .channel("kioku-items")
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "kioku_items", filter: "user_id=eq." + userId },
+          (payload) => {
+            const r = payload && payload.new;
+            if (r && r.kind) this.applyRows([r], false);
+          }
+        )
+        .subscribe();
+    } catch (e) {
+      this._rt = null; // 使えなくても60秒ごとの見直しで追いつきます
+    }
+  }
+
+  unsubscribeRealtime() {
+    try {
+      if (this._rt && this._sbClient && this._sbClient.removeChannel) this._sbClient.removeChannel(this._rt);
+    } catch (e) {}
+    this._rt = null;
+  }
+
+  // 同期の控えを捨てます。学習データ（kioku.mvp.v1）には触りません。
+  // 次に繋いだときは、控えが無いので全部を送り直し、全部を取り直します。
+  forgetSyncState() {
+    ["kioku.sync.at", "kioku.sync.cursor", "kioku.sync.shadow", "kioku.sync.counts", "kioku.sync.legacy", "kioku.sync.base"].forEach(
+      (k) => localStorage.removeItem(k)
+    );
   }
 
   queuePush() {
@@ -1310,12 +1614,12 @@ class App extends Component {
   // 端末で上書きした保存先を捨てます。DEFAULT_SB があればそちらに戻ります。
   clearCfg() {
     localStorage.removeItem("kioku.sync.cfg");
-    localStorage.removeItem("kioku.sync.at");
-    localStorage.removeItem("kioku.sync.base");
     this._sbClient = null;
     this._syncUserEmail = null;
     this._pushPending = false;
     clearTimeout(this._pushT);
+    this.unsubscribeRealtime();
+    this.forgetSyncState();
     const back = DEFAULT_SB.url && DEFAULT_SB.key;
     this.setState({
       syncUser: null,
@@ -3569,7 +3873,7 @@ class App extends Component {
           ${(s.syncAdvanced ? "▾ " : "▸ ") + "別の保存先を使う（自分の Supabase プロジェクト）"}
         </button>`}
 
-        ${advOpen &&
+        ${(advOpen || s.sqlNeeded) &&
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
           <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>保存先を用意する</div>
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.8, marginBottom: 14 }}>
@@ -3689,7 +3993,7 @@ class App extends Component {
                 </div>
                 <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <button style=${primary} onClick=${() => this.pull(false)}>今すぐ同期</button>
-                  <button class="soft" style=${secondary} onClick=${() => this.push(true)}>この端末の内容で上書き</button>
+                  <button class="soft" style=${secondary} onClick=${() => this.push(true)}>この端末の内容を送る</button>
                 </div>
               </div>`}
         </div>`}
