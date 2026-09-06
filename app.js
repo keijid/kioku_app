@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v29";
+const BUILD = "v30";
 
 const C = {
   bg: "#F3EFE6",
@@ -329,7 +329,7 @@ function mergeCounts(base, local, remote) {
   return out;
 }
 
-function mergePayload(base, local, remote) {
+function mergeCore(base, local, remote) {
   const b = base || {};
   const log = mergeCounts(b.log, local.log, remote.log);
   return {
@@ -339,6 +339,32 @@ function mergePayload(base, local, remote) {
     gradeTotals: mergeCounts(b.gradeTotals, local.gradeTotals, remote.gradeTotals),
     todayCount: log[dayKey(Date.now())] || 0,
   };
+}
+
+// 統合で手元のカードが大量に消える結果になったときの安全弁。
+// 壊れた版のアプリがクラウドを切り詰めると、正常な端末からは「別の端末で大量に削除した」
+// のと区別がつきません（実際に Service Worker が古い応答を返していた端末が、
+// 気づかないうちにクラウドを丸ごと上書きし、他の端末がそれを削除として追随しかけました）。
+// 数枚を消し直す手間より、数千枚が黙って消えない方を優先します。
+// 割合と枚数の両方を見るのは、数枚しかない人のふつうの削除まで止めないためです。
+const GUARD_MIN_CARDS = 20; // これ未満なら、ふつうの削除として扱います
+const GUARD_RATIO = 0.3; // 手元のカードのこの割合以上が消えるなら止めます
+
+// { data, guarded } を返します。guarded が真なら、削除を適用せず両方残しました。
+function mergePayload(base, local, remote) {
+  const merged = mergeCore(base, local, remote);
+  if (!base) return { data: merged, guarded: false };
+  const alive = {};
+  merged.cards.forEach((c) => {
+    alive[c.id] = 1;
+  });
+  const mine = local.cards || [];
+  const lost = mine.filter((c) => !alive[c.id]).length;
+  if (lost >= GUARD_MIN_CARDS && lost >= mine.length * GUARD_RATIO) {
+    // base を無かったことにすると、削除の判定が消えて「両方残す」になります。
+    return { data: mergeCore(null, local, remote), guarded: true };
+  }
+  return { data: merged, guarded: false };
 }
 
 // ---------------------------------------------------------------- アプリ本体
@@ -1139,10 +1165,15 @@ class App extends Component {
           return;
         }
         // 相手の内容と突き合わせて1つにまとめます。**どちらの変更も捨てません。**
-        body = mergePayload(this.syncBase(), body, stripSample(cur.data.data || {}).data);
+        const m = mergePayload(this.syncBase(), body, stripSample(cur.data.data || {}).data);
+        body = m.data;
         this.setState(Object.assign({}, body, { syncBusy: true }));
         this.persistLocal(body);
-        this.toast("別の端末の変更と統合しました");
+        this.toast(
+          m.guarded
+            ? "差が大きいため、消さずに両方の内容を残しました"
+            : "別の端末の変更と統合しました"
+        );
       }
       // 端末の時計が遅れていても、クラウドにある時刻より必ず新しい値を書きます。
       // ここを素の Date.now() に戻すと、時計が数分ずれた端末どうしで新旧の判定が
