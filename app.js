@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v31";
+const BUILD = "v32";
 
 const C = {
   bg: "#F3EFE6",
@@ -783,6 +783,8 @@ class App extends Component {
 
   onKey(e) {
     if (this.state.screen !== "study") return;
+    // 学習画面でカードを編集している間は、めくる・評価のショートカットを止めます。
+    if (this.state.editId) return;
     const tag = (e.target.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea") return;
     if (e.key === " " || e.key === "Enter") {
@@ -1878,7 +1880,7 @@ class App extends Component {
           s.screen !== "study" && this.renderHeader(st)
         }
         ${(s.screen === "home" || s.screen === "login") && this.renderHome(st, box, field, primary)}
-        ${s.screen === "study" && this.renderStudy()}
+        ${s.screen === "study" && this.renderStudy(field, primary)}
         ${s.screen === "done" && this.renderDone()}
         ${s.screen === "deck" && this.renderDeck(box, field, primary, backLink, h2Style)}
         ${s.screen === "import" && this.renderImport(box, field, primary, secondary, backLink, h2Style)}
@@ -2494,10 +2496,15 @@ class App extends Component {
     this.toast("取り込みを取り消しました");
   }
 
-  renderStudy() {
+  renderStudy(field, primary) {
     const s = this.state;
     const n = s.narrow;
     const card = s.cards.find((c) => c.id === s.queue[0]);
+    // 出題中のカードをその場で直せます。editId はデッキ画面の一覧編集と共用で、
+    // 保存・キャンセルも同じ saveEdit() / editId: null を使います。
+    // 編集中は評価ボタンと下のリンクを出しません。入力欄と並べると縦が足りなくなるためです。
+    const editing = !!card && s.editId === card.id;
+    const area = Object.assign({}, field, { resize: "vertical", lineHeight: 1.7 });
     const deck = s.decks.find((d) => d.id === s.deckId);
     const done = s.history.length;
     const pct = Math.round((done / Math.max(done + s.queue.length, 1)) * 100);
@@ -2515,7 +2522,7 @@ class App extends Component {
         <div style=${{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}>
           <button
             style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "6px 0" }}
-            onClick=${() => this.setState({ screen: "home", showAnswer: false })}
+            onClick=${() => this.setState({ screen: "home", showAnswer: false, editId: null })}
           >
             ← 中断する
           </button>
@@ -2548,12 +2555,78 @@ class App extends Component {
             }}
           >
             <span>${deck ? deck.name : "すべてのデッキ"}</span>
-            <span style=${{ background: C.bg, borderRadius: 99, padding: "4px 12px", color: C.muted }}>
-              ${card ? stateLabels[card.state] || "復習" : ""}
+            <span style=${{ display: "flex", alignItems: "center", gap: 8 }}>
+              ${card &&
+              !editing &&
+              html`<button
+                class="ghost"
+                style=${{
+                  background: "none",
+                  border: "1px solid " + C.line,
+                  borderRadius: 99,
+                  padding: "4px 12px",
+                  fontSize: 12,
+                  color: C.muted,
+                }}
+                onClick=${() => this.startEdit(card)}
+              >
+                編集
+              </button>`}
+              <span style=${{ background: C.bg, borderRadius: 99, padding: "4px 12px", color: C.muted }}>
+                ${editing ? "編集中" : card ? stateLabels[card.state] || "復習" : ""}
+              </span>
             </span>
           </div>
 
-          <div
+          ${editing &&
+          html`<div style=${{ padding: n ? "16px 18px 18px" : "22px 26px 24px", display: "grid", gap: 10 }}>
+            <textarea
+              rows="2"
+              placeholder="表：問題・単語"
+              value=${s.editFront}
+              onInput=${(e) => this.setState({ editFront: e.target.value })}
+              style=${area}
+            ></textarea>
+            <textarea
+              rows="2"
+              placeholder="裏：答え・意味"
+              value=${s.editBack}
+              onInput=${(e) => this.setState({ editBack: e.target.value })}
+              style=${area}
+            ></textarea>
+            <textarea
+              rows=${n ? "2" : "3"}
+              placeholder="補足：例文・説明（省略可）"
+              value=${s.editHint}
+              onInput=${(e) => this.setState({ editHint: e.target.value })}
+              style=${area}
+            ></textarea>
+            <div style=${{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 2 }}>
+              <button
+                style=${Object.assign({}, primary, { borderRadius: 12, padding: 14 })}
+                onClick=${() => this.saveEdit()}
+              >
+                保存
+              </button>
+              <button
+                class="soft"
+                style=${{
+                  background: C.bg,
+                  border: "1px solid " + C.line,
+                  color: C.inkSoft,
+                  borderRadius: 12,
+                  padding: 14,
+                  fontSize: 14,
+                }}
+                onClick=${() => this.setState({ editId: null })}
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>`}
+
+          ${!editing &&
+          html`<div
             style=${{
               // 答えを出したら minHeight は不要（表だけのときにカードを見栄えよくするためのもの）
               minHeight: s.showAnswer ? 0 : n ? 160 : 210,
@@ -2624,9 +2697,10 @@ class App extends Component {
                 </div>`}
               </div>`}
             </div>
-          </div>
+          </div>`}
 
-          ${!s.showAnswer &&
+          ${!editing &&
+          !s.showAnswer &&
           html`<div
             style=${{
               padding: "20px 22px 26px",
@@ -2655,7 +2729,8 @@ class App extends Component {
             <div style=${{ fontSize: 12, color: C.ghost }}>スペースキーでもめくれます</div>
           </div>`}
 
-          ${s.showAnswer &&
+          ${!editing &&
+          s.showAnswer &&
           html`<div style=${{ padding: "18px 22px 24px", borderTop: "1px solid " + C.lineSoft }}>
             <div style=${{ fontSize: 12, color: C.faint, textAlign: "center", marginBottom: 12 }}>
               どのくらい思い出せましたか？
@@ -2687,7 +2762,8 @@ class App extends Component {
           </div>`}
         </div>
 
-        <div style=${{ display: "flex", justifyContent: "center", gap: 18, marginTop: 18, fontSize: 13 }}>
+        ${!editing &&
+        html`<div style=${{ display: "flex", justifyContent: "center", gap: 18, marginTop: 18, fontSize: 13 }}>
           <button
             disabled=${!s.history.length}
             onClick=${() => this.undo()}
@@ -2704,7 +2780,7 @@ class App extends Component {
           <button style=${{ background: "none", border: "none", color: C.faint, padding: 6 }} onClick=${() => this.bury()}>
             今日はスキップ
           </button>
-        </div>
+        </div>`}
       </main>
     `;
   }
