@@ -1,4 +1,0 @@
-# Supabase CLI 用の設定。いま使っているのは Edge Function の設定だけです。
-# add-card は個人用トークン（kioku_…）で認証するので、ゲートウェイでの JWT 検証を外します。
-[functions.add-card]
-verify_jwt = false

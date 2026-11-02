@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v33";
+const BUILD = "v32";
 
 const C = {
   bg: "#F3EFE6",
@@ -94,21 +94,6 @@ const SQL_SETUP = [
   "do $$ begin",
   "  alter publication supabase_realtime add table kioku_items;",
   "exception when duplicate_object then null; end $$;",
-  "",
-  "-- 外部からカードを追加する API（Edge Function add-card）の個人用トークン。",
-  "-- トークンそのものは保存せず、SHA-256 のハッシュだけを持ちます。",
-  "create table if not exists kioku_api_tokens (",
-  "  token_hash text primary key,",
-  "  user_id uuid not null default auth.uid() references auth.users on delete cascade,",
-  "  label text not null default '',",
-  "  tz_offset integer not null default -540,",
-  "  created_at timestamptz not null default now(),",
-  "  last_used_at timestamptz",
-  ");",
-  "alter table kioku_api_tokens enable row level security;",
-  'drop policy if exists "own rows" on kioku_api_tokens;',
-  'create policy "own rows" on kioku_api_tokens',
-  "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);",
 ].join("\n");
 
 function dayKey(t) {
@@ -427,12 +412,6 @@ class App extends Component {
     authMode: "in", // ログイン画面のタブ "in" | "up"
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
     sqlNeeded: false, // kioku_items がまだ無い（SQL 未実行）ので、SQL を出す
-    // 外部から追加する API（同期画面）。画面表示だけの状態なので persist しません
-    apiOpen: false, // 「外部から追加する（API）」を開いているか
-    apiTokens: null, // 発行済みトークンの一覧（null = まだ読んでいない）
-    apiNewToken: "", // いま発行したトークン。この画面で1度だけ見せます
-    apiLabel: "", // 発行するトークンの名前
-    apiBusy: false,
   };
 
   componentDidMount() {
@@ -1136,123 +1115,9 @@ class App extends Component {
     clearTimeout(this._pushT);
     this.unsubscribeRealtime();
     this.forgetSyncState();
-    this.setState({
-      syncUser: null,
-      syncAt: null,
-      localOnly: false,
-      syncPw: "",
-      syncError: null,
-      screen: "login",
-      apiOpen: false,
-      apiTokens: null,
-      apiNewToken: "",
-    });
+    this.setState({ syncUser: null, syncAt: null, localOnly: false, syncPw: "", syncError: null, screen: "login" });
     localStorage.removeItem("kioku.localonly");
     this.toast("ログアウトしました");
-  }
-
-  // ---------------------------------------------------------------- 外部から追加する API
-  // 実体は Supabase Edge Function「add-card」（supabase/functions/add-card/index.ts）です。
-  // ここでは個人用トークンの発行・一覧・取り消しだけをします。カードの追加そのものは
-  // 関数が kioku_items に行を足し、各端末はいつもの同期（realtime / pull）で受け取ります。
-  // トークンはこの端末で作り、サーバには SHA-256 のハッシュだけを送ります。
-  // 生のトークンは発行した直後にこの画面で1度だけ見せ、どこにも保存しません。
-
-  apiEndpoint() {
-    const c = this.cfg();
-    return c && c.url ? c.url.replace(/\/+$/, "") + "/functions/v1/add-card" : "";
-  }
-
-  // kioku_api_tokens がまだ無い＝SQL の追記分を実行していないとき。
-  apiNeedsSetup(e) {
-    const m = String((e && (e.message || e.details || e.code)) || e);
-    return /kioku_api_tokens/.test(m) && /(does not exist|42P01|PGRST205|schema cache)/i.test(m);
-  }
-
-  apiFail(e) {
-    if (this.apiNeedsSetup(e)) {
-      this.setState({
-        apiBusy: false,
-        sqlNeeded: true,
-        syncError:
-          "外部から追加する機能の準備がまだです。この画面に出ているSQLを Supabase の SQL Editor でもう一度実行してください（kioku_api_tokens テーブルを足します）。",
-      });
-      return;
-    }
-    this.setState({ apiBusy: false, syncError: this.errText(e) });
-  }
-
-  async loadApiTokens() {
-    if (!this._syncUserEmail) return;
-    this.setState({ apiBusy: true });
-    try {
-      const sb = await this.loadSb();
-      const { data, error } = await sb
-        .from("kioku_api_tokens")
-        .select("token_hash, label, created_at, last_used_at")
-        .order("created_at", { ascending: true });
-      if (error) throw error;
-      this.setState({ apiTokens: data || [], apiBusy: false });
-    } catch (e) {
-      this.apiFail(e);
-    }
-  }
-
-  async createApiToken() {
-    if (!this._syncUserEmail || this.state.apiBusy) return;
-    if (!(window.crypto && crypto.subtle)) {
-      this.toast("このブラウザではトークンを作れません（https で開いてください）");
-      return;
-    }
-    const label = (this.state.apiLabel || "").trim() || "トークン";
-    this.setState({ apiBusy: true, syncError: null });
-    try {
-      const bytes = crypto.getRandomValues(new Uint8Array(24));
-      const token =
-        "kioku_" +
-        btoa(String.fromCharCode.apply(null, Array.from(bytes)))
-          .replace(/\+/g, "-")
-          .replace(/\//g, "_")
-          .replace(/=+$/, "");
-      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
-      const hash = Array.from(new Uint8Array(buf))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-      const sb = await this.loadSb();
-      const { data: u } = await sb.auth.getUser();
-      const { error } = await sb.from("kioku_api_tokens").insert({
-        token_hash: hash,
-        user_id: u.user.id,
-        label: label.slice(0, 60),
-        // 関数が新しいカードの due を「この端末の今日の0時」に合わせるために使います
-        tz_offset: new Date().getTimezoneOffset(),
-      });
-      if (error) throw error;
-      this.setState({ apiNewToken: token, apiLabel: "", apiBusy: false });
-      this.loadApiTokens();
-    } catch (e) {
-      this.apiFail(e);
-    }
-  }
-
-  async revokeApiToken(hash) {
-    if (!this._syncUserEmail || this.state.apiBusy) return;
-    this.setState({ apiBusy: true, syncError: null });
-    try {
-      const sb = await this.loadSb();
-      // トークンは同期するデータではないので、行ごと消して構いません（kioku_items とは別です）。
-      const { error } = await sb.from("kioku_api_tokens").delete().eq("token_hash", hash);
-      if (error) throw error;
-      this.setState({ apiBusy: false });
-      this.toast("トークンを取り消しました");
-      this.loadApiTokens();
-    } catch (e) {
-      this.apiFail(e);
-    }
-  }
-
-  copyText(text, done) {
-    if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => this.toast(done), () => {});
   }
 
   // JSON バックアップと移行で使う、全体をひとまとめにした形。
@@ -1764,9 +1629,6 @@ class App extends Component {
       sbUrl: back ? DEFAULT_SB.url : "",
       sbKey: back ? DEFAULT_SB.key : "",
       syncError: null,
-      apiOpen: false,
-      apiTokens: null,
-      apiNewToken: "",
     });
     this.toast(back ? "既定の保存先に戻しました" : "接続を解除しました");
     if (back) this.initSync();
@@ -4031,7 +3893,7 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 720, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
-        <button style=${backLink} onClick=${() => this.setState({ screen: "home", apiNewToken: "" })}>← デッキ一覧</button>
+        <button style=${backLink} onClick=${() => this.setState({ screen: "home" })}>← デッキ一覧</button>
         <div style=${{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <h2 style=${h2Style}>同期とバックアップ</h2>
           <span
@@ -4212,8 +4074,6 @@ class App extends Component {
               </div>`}
         </div>`}
 
-        ${cfg && s.syncUser && this.renderApi(box, field, primary, secondary)}
-
         <div style=${box}>
           <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>ファイルでバックアップ</div>
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.7, marginBottom: 14 }}>
@@ -4258,139 +4118,6 @@ class App extends Component {
         </div>
       </main>
     `;
-  }
-
-  // 同期画面の「外部から追加する（API）」。ログイン中だけ出します。
-  renderApi(box, field, primary, secondary) {
-    const s = this.state;
-    const url = this.apiEndpoint();
-    const mono = {
-      background: C.ink,
-      color: "#D6DCE8",
-      borderRadius: 12,
-      padding: 14,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      fontSize: 11.5,
-      lineHeight: 1.75,
-      whiteSpace: "pre-wrap",
-      wordBreak: "break-all",
-    };
-    const small = Object.assign({}, secondary, { padding: "8px 14px", fontSize: 12 });
-    const sample =
-      "curl -X POST " +
-      url +
-      " \\\n" +
-      '  -H "Authorization: Bearer ' +
-      (s.apiNewToken || "kioku_…") +
-      '" \\\n' +
-      '  -H "Content-Type: application/json" \\\n' +
-      "  -d '{\"deck\":\"英単語\",\"front\":\"apple\",\"back\":\"りんご\",\"hint\":\"I ate an apple.\"}'";
-    const when = (t) =>
-      t ? new Date(t).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "未使用";
-
-    return html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
-      <button
-        class="ghost"
-        style=${{ background: "none", border: "none", padding: 0, fontSize: 14, fontWeight: 700, color: C.ink, cursor: "pointer" }}
-        onClick=${() => {
-          const open = !s.apiOpen;
-          this.setState({ apiOpen: open });
-          if (open && !s.apiTokens) this.loadApiTokens();
-        }}
-      >
-        ${(s.apiOpen ? "▾ " : "▸ ") + "外部から追加する（API）"}
-      </button>
-      ${s.apiOpen &&
-      html`<div style=${{ display: "grid", gap: 14, marginTop: 12 }}>
-        <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.8 }}>
-          スクリプトや iOS ショートカットなど、このアプリの外からデッキにカードを足せます。個人用トークンを発行して、下の宛先に POST してください。追加したカードは同期で各端末に届きます。デッキは名前で指定し、無ければ作ります。同じデッキに表が同じカードがあれば飛ばします。
-        </div>
-
-        <div>
-          <div style=${{ fontSize: 12, color: C.faint, marginBottom: 6 }}>宛先</div>
-          <div style=${mono}>${url}</div>
-        </div>
-
-        ${s.apiNewToken &&
-        html`<div style=${{ border: "1px solid " + C.line, borderRadius: 12, padding: 14, display: "grid", gap: 10 }}>
-          <div style=${{ fontSize: 13, fontWeight: 700 }}>トークンを発行しました</div>
-          <div style=${{ fontSize: 12, color: C.muted, lineHeight: 1.7 }}>
-            この画面を離れると二度と表示されません。いまコピーして、使う側に保存してください。漏れたときは下の一覧から取り消せます。
-          </div>
-          <div style=${mono}>${s.apiNewToken}</div>
-          <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button class="soft" style=${small} onClick=${() => this.copyText(s.apiNewToken, "トークンをコピーしました")}>
-              トークンをコピー
-            </button>
-            <button class="ghost" style=${Object.assign({}, small, { background: "none" })} onClick=${() => this.setState({ apiNewToken: "" })}>
-              閉じる
-            </button>
-          </div>
-        </div>`}
-
-        <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <input
-            placeholder="トークンの名前（例：iPhone ショートカット）"
-            value=${s.apiLabel}
-            maxLength=${60}
-            onInput=${(e) => this.setState({ apiLabel: e.target.value })}
-            onKeyDown=${(e) => {
-              if (e.key === "Enter") this.createApiToken();
-            }}
-            style=${Object.assign({}, field, { fontSize: 13, flex: "1 1 220px", minWidth: 0 })}
-          />
-          <button style=${primary} disabled=${s.apiBusy} onClick=${() => this.createApiToken()}>トークンを発行</button>
-        </div>
-
-        <div>
-          <div style=${{ fontSize: 12, color: C.faint, marginBottom: 6 }}>発行済み</div>
-          ${!s.apiTokens
-            ? html`<div style=${{ fontSize: 12, color: C.faint }}>${s.apiBusy ? "読み込み中…" : "—"}</div>`
-            : !s.apiTokens.length
-            ? html`<div style=${{ fontSize: 12, color: C.faint }}>まだありません</div>`
-            : s.apiTokens.map(
-                (t) => html`<div
-                  key=${t.token_hash}
-                  style=${{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 10,
-                    padding: "10px 0",
-                    borderTop: "1px solid " + C.lineSoft,
-                  }}
-                >
-                  <div style=${{ flex: 1, minWidth: 0 }}>
-                    <div style=${{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>${t.label || "トークン"}</div>
-                    <div style=${{ fontSize: 11, color: C.faint, marginTop: 2 }}>
-                      発行 ${when(t.created_at)} ・ 最終使用 ${when(t.last_used_at)}
-                    </div>
-                  </div>
-                  <button
-                    class="danger"
-                    disabled=${s.apiBusy}
-                    style=${Object.assign({}, small, { background: "none", color: C.faint })}
-                    onClick=${() => {
-                      if (window.confirm("「" + (t.label || "トークン") + "」を取り消します。これを使っている連携は動かなくなります。")) this.revokeApiToken(t.token_hash);
-                    }}
-                  >
-                    取り消す
-                  </button>
-                </div>`
-              )}
-        </div>
-
-        <div>
-          <div style=${{ fontSize: 12, color: C.faint, marginBottom: 6 }}>呼び方の例</div>
-          <div style=${mono}>${sample}</div>
-          <div style=${{ fontSize: 12, color: C.muted, lineHeight: 1.7, marginTop: 8 }}>
-            まとめて追加するときは ${'{"deck":"英単語","cards":[{"front":"…","back":"…"}, …]}'} の形で、1回 500 枚まで。hint（補足）は省略できます。返り値は追加した枚数と、重複で飛ばした表の一覧です。
-          </div>
-          <button class="soft" style=${Object.assign({}, small, { marginTop: 8 })} onClick=${() => this.copyText(sample, "例をコピーしました")}>
-            例をコピー
-          </button>
-        </div>
-      </div>`}
-    </div>`;
   }
 }
 
