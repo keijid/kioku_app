@@ -28,6 +28,8 @@ sw.js        Service Worker。app.js/index.html は network-first、他は cache
 manifest.webmanifest
 icon-*.png
 .nojekyll    GitHub Pages に Jekyll 処理をさせないための空ファイル
+supabase/functions/add-card/index.ts   外部からカードを追加する API（Supabase Edge Function）
+supabase/config.toml                   上の関数の JWT 検証を外す設定
 ```
 
 `app.js` は上から順に：定数・ユーティリティ → 旧サンプルデータの除去（`stripSample`）→ `class App`（状態・学習ロジック・同期・集計）→ 各 `renderXxx()` メソッド。
@@ -360,6 +362,54 @@ Supabase の API はどちらでもないので、素通しでネットワーク
 
 ログアウトと接続解除では `forgetSyncState()` でこれらを捨てます。
 **学習データ（`kioku.mvp.v1`）には触りません。**
+
+## 外部から追加する API（Edge Function `add-card`）
+
+アプリの外（スクリプト、iOS ショートカット、他サービス連携など）からデッキにカードを足すための API です。
+**アプリとは別に Supabase 上で動く唯一のサーバ側コード**で、`supabase/functions/add-card/index.ts` にあります。
+
+```
+POST https://<project>.supabase.co/functions/v1/add-card
+Authorization: Bearer kioku_xxxxxxxx
+{ "deck": "英単語", "front": "apple", "back": "りんご", "hint": "I ate an apple." }
+{ "deck": "英単語", "cards": [ { "front": "…", "back": "…", "hint": "…" }, … ] }   // 1回500枚まで
+```
+
+- **関数は `kioku_items` に行を足すだけです。** 各端末は「別の端末で追加されたカード」として
+  いつもの同期（realtime / `pull()` → `applyRows()`）で受け取ります。アプリ側に専用の受け口はありません
+- 書き込む `data` の形は **`cardRow()` / `deckRow()` と必ず揃えてください。** 関数の中に同じ形を書いています。
+  片方だけ項目を足すと、受け取った端末が毎回「変わった」と判定して送り返し続けます
+- `due` はトークンを発行した端末の「今日の0時」にします（`tz_offset` を使う）。ずれていると
+  取り込んだ端末が `alignDues()` で書き換えて送り返す往復が1回余計に起きます
+- デッキは名前（`deck`）か ID（`deckId`）で指定。名前で見つからなければ作ります（`"createDeck": false` で作らない）。
+  デッキの行をカードより先に書きます
+- 重複判定は一括取り込みと同じく**同じデッキで表の一致だけ**です
+- `updated_at` は書きません（トリガがサーバ時刻を打ちます）
+
+### 認証：個人用トークン
+
+- トークンは同期画面の「外部から追加する（API）」で発行します（`renderApi()` / `createApiToken()`）。
+  **端末で作り、サーバには SHA-256 のハッシュだけを送ります。** 生のトークンは発行直後に1度だけ見せ、
+  どこにも保存しません（`apiNewToken` は画面表示だけの状態で、画面を離れると消します）
+- ハッシュは `kioku_api_tokens`（`SQL_SETUP` の末尾）に入ります。RLS で本人の行だけ読み書き・削除できます。
+  取り消しは行の削除です（同期するデータではないので、`kioku_items` と違って物理削除で構いません）
+- 関数は **service role key** でトークンを引き当て、そのユーザーの行として書き込みます。
+  service role key は関数の環境変数にだけあり、`app.js` には絶対に置かないこと
+- トークンは Supabase の JWT ではないので、**ゲートウェイの JWT 検証を外してデプロイ**します
+  （`supabase/config.toml` の `verify_jwt = false`、または `--no-verify-jwt`）
+
+### デプロイ（GitHub Pages とは別）
+
+main への push では**デプロイされません**。関数を変えたら Supabase CLI で出し直してください。
+
+```bash
+supabase login
+supabase link --project-ref <project-ref>
+supabase functions deploy add-card --no-verify-jwt
+```
+
+`kioku_api_tokens` が無いときは、関数は「SQLを実行してください」と返し、アプリは同期画面に SQL を出します
+（`apiNeedsSetup()`）。
 
 ## 入口（ログイン画面）
 

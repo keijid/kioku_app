@@ -85,6 +85,33 @@ create policy "own rows" on kioku_state
 - データは行単位セキュリティ（RLS）で保護され、各ユーザーは自分の行のみ読み書きできます
 - 競合は「後に書いた方が勝つ」方式（last-write-wins）です
 
+## 外部からカードを追加する API（任意）
+
+Supabase の Edge Function `add-card`（`supabase/functions/add-card/index.ts`）を使うと、スクリプトや iOS ショートカットなどアプリの外からデッキにカードを追加できます。
+
+1. アプリの同期画面に出ている SQL を、もう一度 SQL Editor で実行（`kioku_api_tokens` テーブルが足されます）
+2. 関数をデプロイ
+
+```bash
+supabase functions deploy add-card --no-verify-jwt
+```
+
+3. 同期画面の「外部から追加する（API）」で個人用トークンを発行
+4. 呼び出す
+
+```bash
+curl -X POST https://<project>.supabase.co/functions/v1/add-card \
+  -H "Authorization: Bearer kioku_…" \
+  -H "Content-Type: application/json" \
+  -d '{"deck":"英単語","front":"apple","back":"りんご","hint":"I ate an apple."}'
+```
+
+- まとめて追加するときは `{"deck":"英単語","cards":[{"front":"…","back":"…","hint":"…"}]}`（1回500枚まで）
+- デッキは名前で指定し、無ければ作ります（`"createDeck": false` で作らない）。`deckId` でも指定できます
+- 同じデッキに表が同じカードがあれば飛ばします
+- 返り値：`{"added": 2, "skipped": ["apple"], "deck": {"id": "…", "name": "英単語", "created": false}}`
+- 追加したカードは同期で各端末に届きます
+
 ## ライセンス
 
 MIT
