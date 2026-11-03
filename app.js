@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v35";
+const BUILD = "v36";
 
 const C = {
   bg: "#F3EFE6",
@@ -53,10 +53,10 @@ const FB_SOURCES = [
 // apiKey はブラウザに配られる公開の値で、実際の保護は Firestore のルール（RULES_SETUP）が担っています。
 // 空のままなら同期は使えず、アプリは端末内保存だけで動きます。
 const DEFAULT_FB = {
-  apiKey: "",
-  authDomain: "",
-  projectId: "",
-  appId: "",
+  apiKey: "AIzaSyDn2VKD5mggYYy-OA8tvcFIOSnrkm2gKWU",
+  authDomain: "kioku-b32ba.firebaseapp.com",
+  projectId: "kioku-b32ba",
+  appId: "1:398583079920:web:80ca7c6e8effbe1c35b335",
 };
 
 // 引っ越し先のアドレス。GitHub Pages（旧サイト）で開いたときだけ、ホームに移転の案内を出します。
