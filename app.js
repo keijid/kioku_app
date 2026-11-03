@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v32";
+const BUILD = "v33";
 
 const C = {
   bg: "#F3EFE6",
@@ -410,6 +410,7 @@ class App extends Component {
     booting: false, // 保存済みセッションの復元待ち。ログイン画面のちらつき防止
     localOnly: false, // 「この端末だけで使う」を選んだ
     authMode: "in", // ログイン画面のタブ "in" | "up"
+    googleAuth: null, // 保存先で Google ログインが有効か（null = 未確認。false のときだけボタンを隠す）
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
     sqlNeeded: false, // kioku_items がまだ無い（SQL 未実行）ので、SQL を出す
   };
@@ -515,12 +516,20 @@ class App extends Component {
     // セッションが残っていれば復元が終わるまで待つ。ログイン済みの端末に
     // ログイン画面が一瞬映らないようにするためです（SDK は CDN から非同期に読み込むので）。
     const hasSession = !!localStorage.getItem("kioku.sb.auth");
-    this._hadStoredSession = hasSession;
+    // Google ログインから戻ってきたところか。URL に ?code= が付いていれば、SDK がそれを
+    // セッションに交換するまで「読み込み中…」を出します（ログイン画面のちらつき防止）。
+    const ret = this.oauthReturn();
+    this._oauthReturning = ret.code;
+    this._oauthError = ret.error;
+    this._hadStoredSession = hasSession || ret.code;
     this.setState({
       localOnly: localStorage.getItem("kioku.localonly") === "1",
-      booting: !!c && hasSession,
+      booting: !!c && (hasSession || ret.code),
+      syncError: ret.error,
     });
+    if (ret.error) this.clearOauthParams();
     this.initSync();
+    this.checkGoogleAuth();
   }
 
   componentWillUnmount() {
@@ -985,7 +994,9 @@ class App extends Component {
       let client = null;
       try {
         client = create(c.url, c.key, {
-          auth: { persistSession: true, storageKey: "kioku.sb.auth" },
+          // flowType は Google ログイン用です。戻り先の URL に ?code= が付き、SDK が
+          // 自動でセッションに交換します（detectSessionInUrl は既定で有効）。
+          auth: { persistSession: true, storageKey: "kioku.sb.auth", flowType: "pkce" },
         });
       } catch (e) {
         notes.push(where + "：初期化に失敗（" + (e.message || e) + "）");
@@ -1015,6 +1026,17 @@ class App extends Component {
       this.setSyncUser(user ? user.email : null);
       this.setState({ booting: false });
       if (user) this.leaveLocalOnly();
+      if (this._oauthReturning) {
+        // ?code= を残すと、再読み込みのたびに使用済みのコードを交換しようとして失敗します。
+        this._oauthReturning = false;
+        this.clearOauthParams();
+        if (user) {
+          if (this.state.screen === "login") this.setState({ screen: "home" });
+          this.toast("ログインしました");
+        } else {
+          this.setState({ syncError: "Google でのログインを完了できませんでした。もう一度お試しください。" });
+        }
+      }
       if (!this._authSub) {
         this._authSub = sb.auth.onAuthStateChange((evt, session) => {
           const u = session ? session.user.email : null;
@@ -1036,7 +1058,8 @@ class App extends Component {
     } catch (e) {
       // 復元するセッションが無いなら、まだ何もしていない人にエラーを見せる必要はありません。
       // 実際に困るのはログインを押したときで、そこで同じエラーが出ます。
-      this.setState({ syncError: this._hadStoredSession ? this.errText(e) : null, booting: false });
+      // Google ログインを取り消して戻ってきたときのメッセージは消さずに残します。
+      this.setState({ syncError: this._hadStoredSession ? this.errText(e) : this._oauthError || null, booting: false });
     } finally {
       this._initializing = false;
     }
@@ -1102,6 +1125,89 @@ class App extends Component {
     } catch (e) {
       this.setState({ syncBusy: false, syncError: this.errText(e) });
     }
+  }
+
+  // Google ログイン。Supabase の認可画面へページごと移動し、終わると redirectTo に戻ってきます。
+  // 戻ってきたあとの処理（?code= の交換）は initSync の getSession が SDK 経由で行います。
+  // 学習データは persist の時点で localStorage に書かれているので、ページを離れても失われません。
+  async signInWithGoogle() {
+    this.setState({ syncBusy: true, syncError: null });
+    try {
+      const sb = await this.loadSb();
+      const res = await sb.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: location.origin + location.pathname },
+      });
+      if (res.error) throw res.error;
+      // ここから先はページが移動します。移動できなかった場合に備えて通信中表示だけ戻します。
+      setTimeout(() => this.setState({ syncBusy: false }), 8000);
+    } catch (e) {
+      this.setState({ syncBusy: false, syncError: this.errText(e) });
+    }
+  }
+
+  // URL の ?code= / ?error= を読みます。エラーは Google 側で「キャンセル」したときなどに付きます。
+  oauthReturn() {
+    const q = new URLSearchParams(location.search);
+    const h = new URLSearchParams(location.hash.replace(/^#/, ""));
+    const desc = q.get("error_description") || h.get("error_description");
+    const err = q.get("error") || h.get("error");
+    return {
+      code: !!q.get("code"),
+      error: err ? "Google でのログインを完了できませんでした。" + (desc ? "（" + desc + "）" : "") : null,
+    };
+  }
+
+  clearOauthParams() {
+    try {
+      history.replaceState(null, "", location.pathname);
+    } catch (e) {}
+  }
+
+  // 保存先で Google ログインが有効になっているかを、Supabase の公開設定から確かめます。
+  // 有効にしていない保存先でボタンを押すと、Supabase の英語のエラーページに飛ばされるためです。
+  // 確かめられなかったとき（オフラインなど）は null のままにして、ボタンは出しておきます。
+  async checkGoogleAuth() {
+    const c = this.cfg();
+    if (!c || this._googleAuthFor === c.url) return;
+    this._googleAuthFor = c.url;
+    try {
+      const r = await fetch(c.url.replace(/\/+$/, "") + "/auth/v1/settings", { headers: { apikey: c.key } });
+      if (!r.ok) throw new Error(String(r.status));
+      const j = await r.json();
+      this.setState({ googleAuth: !!(j && j.external && j.external.google) });
+    } catch (e) {
+      this._googleAuthFor = null;
+      this.setState({ googleAuth: null });
+    }
+  }
+
+  // ログイン画面と同期画面の両方に出す「Google でログイン」。
+  googleLoginButton(style) {
+    const s = this.state;
+    if (s.googleAuth === false) return null;
+    // iPhone / iPad のホーム画面に追加したアプリは、外部サイトでのログインを別の画面で開き、
+    // そこで得たログイン状態をアプリ側に持ち帰れないことがあります。
+    const iosStandalone = navigator.standalone === true;
+    return html`<div style=${{ display: "grid", gap: 8 }}>
+      <button
+        class="soft"
+        disabled=${s.syncBusy}
+        style=${Object.assign({}, style, { width: "100%", fontWeight: 700 })}
+        onClick=${() => this.signInWithGoogle()}
+      >
+        Google でログイン
+      </button>
+      ${iosStandalone &&
+      html`<div style=${{ fontSize: 11, color: C.faint, lineHeight: 1.7 }}>
+        ホーム画面のアプリからはログインが完了しないことがあります。その場合はメールアドレスでログインしてください。
+      </div>`}
+      <div style=${{ display: "flex", alignItems: "center", gap: 10, color: C.ghost, fontSize: 11, margin: "4px 0" }}>
+        <div style=${{ flex: 1, height: 1, background: C.lineSoft }}></div>
+        または
+        <div style=${{ flex: 1, height: 1, background: C.lineSoft }}></div>
+      </div>
+    </div>`;
   }
 
   async signOut() {
@@ -1611,6 +1717,7 @@ class App extends Component {
     this.setState({ sbUrl: origin, syncError: null });
     this.toast("接続情報を保存しました");
     this.initSync();
+    this.checkGoogleAuth();
   }
 
   // 端末で上書きした保存先を捨てます。DEFAULT_SB があればそちらに戻ります。
@@ -1631,7 +1738,10 @@ class App extends Component {
       syncError: null,
     });
     this.toast(back ? "既定の保存先に戻しました" : "接続を解除しました");
-    if (back) this.initSync();
+    if (back) {
+      this.initSync();
+      this.checkGoogleAuth();
+    }
   }
 
   // 端末に古い版が残ったときの逃げ道。キャッシュとService Workerを捨てて読み直します。
@@ -3797,6 +3907,7 @@ class App extends Component {
           </div>
 
           <div style=${{ display: "grid", gap: 10 }}>
+            ${this.googleLoginButton(secondary)}
             <input
               type="email"
               autocomplete="email"
@@ -4024,6 +4135,7 @@ class App extends Component {
           <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>アカウント</div>
           ${!s.syncUser
             ? html`<div style=${{ display: "grid", gap: 10 }}>
+                ${this.googleLoginButton(secondary)}
                 <input
                   type="email"
                   placeholder="メールアドレス"

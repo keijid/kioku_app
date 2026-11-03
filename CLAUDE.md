@@ -246,7 +246,7 @@ Undo（`undo()`）は `history` に評価前のカード・キュー・`tally`�
   同期画面の「別の保存先を使う」から手入力する従来の流れになります
 - `cfg()` は「端末で保存した設定 → `DEFAULT_SB`」の順に返します。localStorage の形式は変えていません
 - Supabase JS SDK は同期を初めて使うときに動的 import します（初期表示を軽くするため）
-- 認証はメール＋パスワード
+- 認証はメール＋パスワードと、Google ログイン（下の節）
 - キーは **publishable key**（`sb_publishable_…`／旧 anon key）。secret key は絶対に使わないこと
 - セットアップSQLは `app.js` の `SQL_SETUP` にあり、アプリ内に表示されます
 
@@ -348,6 +348,26 @@ Supabase の API はどちらでもないので、素通しでネットワーク
 `kioku_items` が無いと PostgREST は `PGRST205` を返します。`needsSetup()` がそれを見て、
 同期画面に SQL を出し、「実行するまで端末内にだけ保存されます」と伝えます（`syncFail()`）。
 **この経路を消さないでください。** 黙って失敗すると、利用者は同期が壊れたと思います。
+
+### Google ログイン
+
+Supabase の OAuth（`signInWithOAuth`）を使います。`signInWithGoogle()` がページごと Google へ移動し、
+終わると `redirectTo`（`location.origin + location.pathname`）に `?code=` 付きで戻ってきます。
+
+- クライアントは `flowType: "pkce"` で作ります。戻ってきた `?code=` は `initSync()` の
+  `getSession()` の中で SDK がセッションに交換します（`detectSessionInUrl` は既定で有効）
+- 戻ってきたときは `componentDidMount()` で `oauthReturn()` が URL を見て `booting` を立てます。
+  交換が終わったら `clearOauthParams()` で URL から `?code=` を消します（残すと再読み込みで使用済みのコードを交換しようとして失敗します）
+- Google 側でキャンセルすると `?error=` 付きで戻るので、その旨を `syncError` に出します
+- ボタンは `checkGoogleAuth()` が Supabase の公開設定（`/auth/v1/settings`）を見て、
+  **Google が無効な保存先では出しません。** 押すと Supabase の英語のエラーページに飛ばされるためです。
+  確かめられないとき（オフラインなど）は出しておきます
+- 同じメールアドレスの既存アカウントには Supabase が自動で紐づけるので、メールで作ったデータがそのまま見えます
+- iOS のホーム画面に追加したアプリでは、外部サイトでのログイン結果をアプリへ持ち帰れないことがあるため、注記を出しています
+
+Supabase 側で必要な設定（コードの外）：Authentication → Sign In / Providers → Google を有効にして
+Google Cloud の OAuth クライアント ID / シークレットを入れる。Authentication → URL Configuration の
+Redirect URLs に `https://keijid.github.io/kioku_app/**`（ローカル確認なら `http://localhost:8000/**` も）を足す。
 
 ### localStorage のキー（同期用）
 
