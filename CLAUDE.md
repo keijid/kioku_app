@@ -265,7 +265,7 @@ Undo（`undo()`）は `history` に評価前のカード・キュー・`tally`�
   Supabase 宛ての控え（cursor / shadow / legacy / at / `kioku.sb.auth` / Supabase 形式の `kioku.sync.cfg`）を捨てます。
   **`kioku.mvp.v1`・`kioku.sync.counts`・`kioku.sync.device` は残します**
 - Supabase でログインしていた端末には、ホームの帯で「もう一度ログインしてください」と出します（`kioku.sync.moved`）。
-  アカウントは引き継がれないので、メールで使っていた人は新規登録し直しです
+  アカウントは引き継がれないので、Google アカウントでログインし直してもらいます
 - 学習枚数は `seedCounts()` で持ち込みます（下の「学習枚数と評価の累計」）
 - 2台目以降の端末がログインしたときは、`applyRows()` が「控えに無い項目は相手を優先」するので、
   先に移った端末の内容と自然に合わさります
@@ -395,8 +395,8 @@ Firebase の API（`*.googleapis.com`）はどちらでもないので、素通�
 
 ### ログイン
 
-- メール＋パスワード：`createUserWithEmailAndPassword` / `signInWithEmailAndPassword`。
-  Firebase は登録と同時にログインします（確認メールは送りません）
+- **ログイン方法は Google だけです。** メール＋パスワードは v38 でやめました（入力欄・新規登録タブ・`signIn()` を削除）。
+  新規の人も「Google でログイン」を押すだけで、アカウントは初回に自動で作られます
 - Google：開いている場所で方式を変えます（`onOwnHosting()`）
   - **Firebase Hosting（`<projectId>.web.app` / `.firebaseapp.com`）**：`signInWithRedirect`。
     `loadFb()` が `authDomain` をいま開いているドメインに差し替えるので、ログイン処理（`/__/auth/handler`）が
@@ -410,7 +410,7 @@ Firebase の API（`*.googleapis.com`）はどちらでもないので、素通�
 - iOS のホーム画面に追加したアプリではポップアップが完了しないことがあるため、ポップアップ方式のときだけ注記を出しています
 
 Firebase 側で必要な設定（コードの外）：Firestore Database を作成してルールを貼る。
-Authentication → Sign-in method で「メール / パスワード」と「Google」を有効にする。
+Authentication → Sign-in method で「Google」を有効にする（「メール / パスワード」は不要）。
 `<projectId>.web.app` と `.firebaseapp.com` は Authentication の承認済みドメインに最初から入っています。
 **Google Cloud コンソールの OAuth クライアント（Web client (auto created by Google Service)）の
 「承認済みのリダイレクト URI」に `https://<projectId>.web.app/__/auth/handler` を足す必要があります。**

@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v37";
+const BUILD = "v38";
 
 const C = {
   bg: "#F3EFE6",
@@ -438,8 +438,6 @@ class App extends Component {
     lastImport: null, // { ids, deckId, deckName, deckCreated }
     // 同期
     fbCfgText: "", // 「別の保存先を使う」に貼る firebaseConfig
-    syncEmail: "",
-    syncPw: "",
     syncUser: null,
     syncBusy: false,
     syncError: null,
@@ -447,7 +445,6 @@ class App extends Component {
     // 入口（ログイン画面）
     booting: false, // 保存済みセッションの復元待ち。ログイン画面のちらつき防止
     localOnly: false, // 「この端末だけで使う」を選んだ
-    authMode: "in", // ログイン画面のタブ "in" | "up"
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
     movedBackend: false, // Supabase から移った直後で、まだ Firebase にログインしていない
     rulesNeeded: false, // Firestore の準備（データベース作成・ルール）がまだなので、ルールを出す
@@ -957,12 +954,6 @@ class App extends Component {
   authErrText(e) {
     const code = String((e && e.code) || "");
     const map = {
-      "auth/invalid-credential": "メールアドレスかパスワードが違います。",
-      "auth/wrong-password": "メールアドレスかパスワードが違います。",
-      "auth/user-not-found": "このメールアドレスは登録されていません。はじめての方は「新規登録」を選んでください。",
-      "auth/invalid-email": "メールアドレスの形式が正しくありません。",
-      "auth/email-already-in-use": "このメールアドレスは登録済みです。「ログイン」を選んでください。",
-      "auth/weak-password": "パスワードは6文字以上にしてください。",
       "auth/too-many-requests": "試行回数が多すぎます。しばらく待ってからもう一度お試しください。",
       "auth/network-request-failed": "通信できませんでした。回線を確かめてもう一度お試しください。",
       "auth/operation-not-allowed":
@@ -973,7 +964,7 @@ class App extends Component {
       "auth/popup-closed-by-user": null,
       "auth/cancelled-popup-request": null,
       "auth/account-exists-with-different-credential":
-        "このメールアドレスは別の方法で登録されています。メールアドレスとパスワードでログインしてください。",
+        "この Google アカウントのメールアドレスは、別の方法で登録済みです。",
     };
     if (Object.prototype.hasOwnProperty.call(map, code)) return map[code];
     return this.errText(e);
@@ -1235,13 +1226,12 @@ class App extends Component {
     return !!this._syncUserEmail && this.state.screen !== "study";
   }
 
-  // ログインが済んだあとの共通処理。メールでも Google でもここを通します。
+  // ログインが済んだあとの共通処理（ポップアップ方式の Google ログインから呼びます）。
   async afterSignIn(user) {
     this.leaveLocalOnly();
     localStorage.removeItem("kioku.sync.moved");
     this.setSyncUser(user.email || user.uid);
     this.setState({
-      syncPw: "",
       syncBusy: false,
       syncError: null,
       movedBackend: false,
@@ -1251,27 +1241,6 @@ class App extends Component {
     this.toast("ログインしました");
     await this.pull(true);
     this.subscribeRealtime();
-  }
-
-  async signIn(mode) {
-    const email = (this.state.syncEmail || "").trim();
-    const pw = this.state.syncPw || "";
-    if (!email || pw.length < 6) {
-      this.toast("メールと6文字以上のパスワードを入力してください");
-      return;
-    }
-    this.setState({ syncBusy: true, syncError: null });
-    try {
-      const kit = await this.loadFb();
-      // Firebase は登録と同時にログインします（確認メールを待つ必要はありません）。
-      const cred =
-        mode === "up"
-          ? await kit.Au.createUserWithEmailAndPassword(kit.auth, email, pw)
-          : await kit.Au.signInWithEmailAndPassword(kit.auth, email, pw);
-      await this.afterSignIn(cred.user);
-    } catch (e) {
-      this.setState({ syncBusy: false, syncError: this.authErrText(e) });
-    }
   }
 
   // Google ログイン。
@@ -1311,7 +1280,8 @@ class App extends Component {
     );
   }
 
-  // ログイン画面と同期画面の両方に出す「Google でログイン」。
+  // ログイン画面と同期画面の両方に出す「Google でログイン」。ログイン方法は Google だけです
+  // （メール / パスワードは v38 でやめました。Firebase 側でも無効にしてかまいません）。
   googleLoginButton(style) {
     const s = this.state;
     // iPhone / iPad のホーム画面に追加したアプリでは、ログイン用のウィンドウを開けないことがあります。
@@ -1319,22 +1289,17 @@ class App extends Component {
     const iosStandalone = navigator.standalone === true && !onOwnHosting(this.cfg());
     return html`<div style=${{ display: "grid", gap: 8 }}>
       <button
-        class="soft"
+        class="cta"
         disabled=${s.syncBusy}
-        style=${Object.assign({}, style, { width: "100%", fontWeight: 700 })}
+        style=${Object.assign({}, style, { width: "100%" })}
         onClick=${() => this.signInWithGoogle()}
       >
-        Google でログイン
+        ${s.syncBusy ? "通信中…" : "Google でログイン"}
       </button>
       ${iosStandalone &&
       html`<div style=${{ fontSize: 11, color: C.faint, lineHeight: 1.7 }}>
-        ホーム画面のアプリからはログインが完了しないことがあります。その場合はメールアドレスでログインしてください。
+        ホーム画面のアプリからはログインが完了しないことがあります。その場合は Safari で開いてログインしてください。
       </div>`}
-      <div style=${{ display: "flex", alignItems: "center", gap: 10, color: C.ghost, fontSize: 11, margin: "4px 0" }}>
-        <div style=${{ flex: 1, height: 1, background: C.lineSoft }}></div>
-        または
-        <div style=${{ flex: 1, height: 1, background: C.lineSoft }}></div>
-      </div>
     </div>`;
   }
 
@@ -1349,7 +1314,7 @@ class App extends Component {
     clearTimeout(this._pushT);
     this.unsubscribeRealtime();
     this.forgetSyncState();
-    this.setState({ syncUser: null, syncAt: null, localOnly: false, syncPw: "", syncError: null, screen: "login" });
+    this.setState({ syncUser: null, syncAt: null, localOnly: false, syncError: null, screen: "login" });
     localStorage.removeItem("kioku.localonly");
     this.toast("ログアウトしました");
   }
@@ -2276,7 +2241,7 @@ class App extends Component {
         >
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
             ${s.movedBackend
-              ? "同期の保存先を新しくしました。もう一度ログインしてください（メールアドレスで使っていた方は「新規登録」から登録し直してください）。学習データはこの端末に残っています。"
+              ? "同期の保存先を新しくしました。Google アカウントでもう一度ログインしてください。学習データはこの端末に残っています。"
               : "いまはこの端末の中だけに保存されています。ログインすると他の端末と同じ状態になります。"}
           </div>
           <button
@@ -3978,26 +3943,11 @@ class App extends Component {
   }
 
   // 入口。デッキやカードを見る前に、ここでログインします。
-  // 保存先（firebaseConfig）は DEFAULT_FB に持たせているので、ここで聞くのはメールとパスワードだけです。
+  // 保存先（firebaseConfig）は DEFAULT_FB に持たせているので、ここでは Google でログインしてもらうだけです。
   renderLogin(box, field, primary, secondary) {
     const s = this.state;
-    const up = s.authMode === "up";
-    const tab = (on) => ({
-      flex: 1,
-      background: on ? C.surface : "none",
-      border: "1px solid " + (on ? C.line : "transparent"),
-      color: on ? C.ink : C.faint,
-      borderRadius: 999,
-      padding: "9px 0",
-      fontSize: 13,
-      fontWeight: on ? 700 : 400,
-    });
     // 手元に学習データがある人と、いちどローカル専用を選んだ人は、ログインせずに戻れます。
     const canGoBack = !!this._hadSavedData || s.localOnly;
-    const submit = () => this.signIn(s.authMode);
-    const onEnter = (e) => {
-      if (e.key === "Enter") submit();
-    };
 
     return html`
       <main
@@ -4032,67 +3982,9 @@ class App extends Component {
         </div>
 
         <div style=${box}>
-          <div
-            style=${{
-              display: "flex",
-              gap: 4,
-              background: C.field,
-              border: "1px solid " + C.lineSoft,
-              borderRadius: 999,
-              padding: 4,
-              marginBottom: 18,
-            }}
-          >
-            <button
-              class="ghost"
-              style=${tab(!up)}
-              onClick=${() => this.setState({ authMode: "in", syncError: null })}
-            >
-              ログイン
-            </button>
-            <button
-              class="ghost"
-              style=${tab(up)}
-              onClick=${() => this.setState({ authMode: "up", syncError: null })}
-            >
-              新規登録
-            </button>
-          </div>
-
-          <div style=${{ display: "grid", gap: 10 }}>
-            ${this.googleLoginButton(secondary)}
-            <input
-              type="email"
-              autocomplete="email"
-              placeholder="メールアドレス"
-              value=${s.syncEmail}
-              onInput=${(e) => this.setState({ syncEmail: e.target.value })}
-              onKeyDown=${onEnter}
-              style=${Object.assign({}, field, { fontSize: 14 })}
-            />
-            <input
-              type="password"
-              autocomplete=${up ? "new-password" : "current-password"}
-              placeholder="パスワード（6文字以上）"
-              value=${s.syncPw}
-              onInput=${(e) => this.setState({ syncPw: e.target.value })}
-              onKeyDown=${onEnter}
-              style=${Object.assign({}, field, { fontSize: 14 })}
-            />
-            <button
-              class="cta"
-              disabled=${s.syncBusy}
-              style=${Object.assign({}, primary, { width: "100%", marginTop: 4 })}
-              onClick=${submit}
-            >
-              ${s.syncBusy ? "通信中…" : up ? "登録してはじめる" : "ログイン"}
-            </button>
-          </div>
-
+          ${this.googleLoginButton(primary)}
           <div style=${{ fontSize: 12, color: C.faint, lineHeight: 1.8, marginTop: 14 }}>
-            ${up
-              ? "登録すると、学習履歴とカードが複数の端末で同じ状態になります。"
-              : "はじめての方は「新規登録」を選んでください。"}
+            Google アカウントでログインすると、学習履歴とカードが複数の端末で同じ状態になります。はじめての方もそのままどうぞ。
           </div>
         </div>
 
@@ -4119,7 +4011,7 @@ class App extends Component {
             ? html`<button
                 class="ghost"
                 style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "8px 12px" }}
-                onClick=${() => this.setState({ screen: "home", syncError: null, syncPw: "" })}
+                onClick=${() => this.setState({ screen: "home", syncError: null })}
               >
                 ← デッキ一覧に戻る
               </button>`
@@ -4128,7 +4020,7 @@ class App extends Component {
                   style=${{ background: "none", border: "none", color: C.faint, fontSize: 13, padding: "8px 12px" }}
                   onClick=${() => {
                     localStorage.setItem("kioku.localonly", "1");
-                    this.setState({ localOnly: true, screen: "home", syncError: null, syncPw: "" });
+                    this.setState({ localOnly: true, screen: "home", syncError: null });
                   }}
                 >
                   ログインせずにこの端末だけで使う
@@ -4219,7 +4111,7 @@ class App extends Component {
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.8, marginBottom: 14 }}>
             <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer">Firebase コンソール</a>
             で無料プロジェクトを作り、Firestore Database を作成して、「ルール」タブに下のルールを貼って公開します。
-            Authentication では「メール / パスワード」と「Google」を有効にしてください。
+            Authentication では「Google」を有効にしてください。
             最後に、プロジェクトの設定 → マイアプリでウェブアプリを追加し、表示される <strong>firebaseConfig</strong> をコピーします。
           </div>
           <div
@@ -4290,28 +4182,7 @@ class App extends Component {
           <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>アカウント</div>
           ${!s.syncUser
             ? html`<div style=${{ display: "grid", gap: 10 }}>
-                ${this.googleLoginButton(secondary)}
-                <input
-                  type="email"
-                  placeholder="メールアドレス"
-                  value=${s.syncEmail}
-                  onInput=${(e) => this.setState({ syncEmail: e.target.value })}
-                  style=${Object.assign({}, field, { fontSize: 13 })}
-                />
-                <input
-                  type="password"
-                  placeholder="パスワード（6文字以上）"
-                  value=${s.syncPw}
-                  onInput=${(e) => this.setState({ syncPw: e.target.value })}
-                  style=${Object.assign({}, field, { fontSize: 13 })}
-                />
-                <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <button disabled=${s.syncBusy} style=${primary} onClick=${() => this.signIn("in")}>ログイン</button>
-                  <button class="soft" disabled=${s.syncBusy} style=${secondary} onClick=${() => this.signIn("up")}>
-                    新規登録
-                  </button>
-                </div>
-                ${s.syncBusy && html`<div style=${{ fontSize: 12, color: C.faint }}>通信中…</div>`}
+                ${this.googleLoginButton(primary)}
               </div>`
             : html`<div style=${{ display: "grid", gap: 14 }}>
                 <div style=${{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>

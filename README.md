@@ -60,7 +60,7 @@ main への push で GitHub Actions が Firebase Hosting に公開します。�
 ## 同期（任意・Firebase）
 
 設定しない場合、学習データは端末内にのみ保存されます。既定の保存先（Firebase プロジェクト `kioku-b32ba`）は
-`app.js` の `DEFAULT_FB` に入っており、ログインするだけで複数端末で同期できます（Google またはメールアドレス）。
+`app.js` の `DEFAULT_FB` に入っており、ログインするだけで複数端末で同期できます（Google アカウントでログイン）。
 
 自分の Firebase プロジェクトを使う場合は、アプリの「同期」画面 →「別の保存先を使う」の手順に従い、
 Firestore のルールを貼ってから firebaseConfig を貼り付けます。設計の詳細は [CLAUDE.md](./CLAUDE.md) の「同期」の節にあります。
