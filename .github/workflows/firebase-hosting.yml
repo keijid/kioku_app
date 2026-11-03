@@ -1,0 +1,30 @@
+# main に push したら Firebase Hosting に公開します（ビルド工程はありません。ファイルをそのまま上げます）。
+# 必要なもの：
+#   - リポジトリの Secrets に FIREBASE_SERVICE_ACCOUNT（Firebase Hosting 管理者権限のサービスアカウント鍵 JSON）
+#   - .firebaserc にプロジェクトID
+# Secret が無いあいだは何もせずに終わります（GitHub Pages 側の公開には影響しません）。
+name: Firebase Hosting
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 鍵が登録されているか確かめる
+        id: check
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$SA" ]; then echo "ready=1" >> "$GITHUB_OUTPUT"; else echo "FIREBASE_SERVICE_ACCOUNT が未登録なので公開しません"; fi
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.ready == '1'
+      - uses: FirebaseExtended/action-hosting-deploy@v0
+        if: steps.check.outputs.ready == '1'
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          channelId: live

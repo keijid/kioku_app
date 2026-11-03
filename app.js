@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v34";
+const BUILD = "v35";
 
 const C = {
   bg: "#F3EFE6",
@@ -58,6 +58,20 @@ const DEFAULT_FB = {
   projectId: "",
   appId: "",
 };
+
+// 引っ越し先のアドレス。GitHub Pages（旧サイト）で開いたときだけ、ホームに移転の案内を出します。
+// 空のあいだは案内を出しません。旧サイトも main から同じ app.js で公開されるので、ホスト名で見分けます。
+const OLD_HOST = "keijid.github.io";
+const NEW_HOME = "";
+
+// Firebase Hosting で公開しているページか（このプロジェクトの web.app / firebaseapp.com）。
+// そうなら、ログイン処理（/__/auth/handler）がアプリと同じドメインに載っているので、
+// Google ログインをページ移動（リダイレクト）方式で行えます。iPhone のホーム画面アプリでも
+// ポップアップに頼らずログインできるのはこの場合だけです。
+function onOwnHosting(c) {
+  const h = location.hostname;
+  return !!c && (h === c.projectId + ".web.app" || h === c.projectId + ".firebaseapp.com");
+}
 
 // Firestore のルール。Firebase コンソールの Firestore Database → ルール に貼って公開します。
 // - 自分の users/{uid} の下しか読み書きできません
@@ -546,10 +560,16 @@ class App extends Component {
     // セッションが残っていれば復元が終わるまで待つ。ログイン済みの端末に
     // ログイン画面が一瞬映らないようにするためです（SDK は CDN から非同期に読み込むので）。
     const hasSession = this.hasFbSession();
-    this._hadStoredSession = hasSession;
+    // Google ログイン（リダイレクト）から戻ってきたところか。結果を受け取るまで「読み込み中…」にします。
+    let redirecting = false;
+    try {
+      redirecting = sessionStorage.getItem("kioku.redirecting") === "1";
+    } catch (e) {}
+    this._googleRedirectPending = redirecting;
+    this._hadStoredSession = hasSession || redirecting;
     this.setState({
       localOnly: localStorage.getItem("kioku.localonly") === "1",
-      booting: !!c && hasSession,
+      booting: !!c && (hasSession || redirecting),
       movedBackend: localStorage.getItem("kioku.sync.moved") === "1",
     });
     // セッションが無くても SDK は先に読み込んでおきます。Google ログインのポップアップは
@@ -1062,7 +1082,11 @@ class App extends Component {
         try {
           // 保存先ごとに別の名前で作ります。保存先を切り替えたときに古い設定を引きずらないためです。
           const name = "kioku-" + c.projectId;
-          const app = A.getApps().find((a) => a.name === name) || A.initializeApp(c, name);
+          // Firebase Hosting で開いているときは、ログイン処理の置き場所（authDomain）を
+          // いま開いているドメインにします。別ドメインだと、最近のブラウザはログイン結果を
+          // 受け渡せません（サードパーティの保存領域が分けられているため）。
+          const opts = onOwnHosting(c) ? Object.assign({}, c, { authDomain: location.host }) : c;
+          const app = A.getApps().find((a) => a.name === name) || A.initializeApp(opts, name);
           let auth;
           try {
             // セッションは localStorage に置きます（既定の IndexedDB だと、起動時に
@@ -1144,7 +1168,27 @@ class App extends Component {
     this._initializing = true;
     try {
       const kit = await this.loadFb();
-      const user = await this.authReady(kit);
+      let user = await this.authReady(kit);
+      // Google ログイン（リダイレクト）から戻ってきたところなら、結果を受け取ります。
+      // 取り消したときや失敗したときの理由はここでしか分かりません。
+      if (this._googleRedirectPending) {
+        this._googleRedirectPending = false;
+        try {
+          sessionStorage.removeItem("kioku.redirecting");
+        } catch (e) {}
+        try {
+          const res = await kit.Au.getRedirectResult(kit.auth);
+          if (res && res.user) user = res.user;
+        } catch (e) {
+          const msg = this.authErrText(e);
+          if (msg) this.setState({ syncError: msg });
+        }
+        if (user) {
+          localStorage.removeItem("kioku.sync.moved");
+          this.setState({ movedBackend: false, screen: this.state.screen === "login" ? "home" : this.state.screen });
+          this.toast("ログインしました");
+        }
+      }
       this.setSyncUser(user ? user.email || user.uid : null);
       this.setState({ booting: false });
       if (user) this.leaveLocalOnly();
@@ -1235,8 +1279,11 @@ class App extends Component {
     }
   }
 
-  // Google ログイン。ポップアップで開きます（ページ移動のリダイレクト方式は、
-  // Firebase Hosting 以外に置いたサイトでは最近のブラウザで動かないため使いません）。
+  // Google ログイン。
+  // - Firebase Hosting で開いているとき：ページ移動（リダイレクト）方式。iPhone のホーム画面アプリでも
+  //   完了します。戻ってきたあとは initSync() が結果を受け取ります（kioku.redirecting の印）
+  // - それ以外（GitHub Pages の旧サイトなど）：ポップアップ方式。リダイレクトは別ドメインだと
+  //   最近のブラウザで動かないため使えません
   // ポップアップは「押した直後」に開かないとブラウザに止められるので、SDK は先に読み込んでおき、
   // ここでは await を挟まずに signInWithPopup を呼びます。
   signInWithGoogle() {
@@ -1250,6 +1297,19 @@ class App extends Component {
     this.setState({ syncBusy: true, syncError: null });
     const provider = new kit.Au.GoogleAuthProvider();
     provider.setCustomParameters({ prompt: "select_account" });
+    if (onOwnHosting(this.cfg())) {
+      // 学習データは persist の時点で localStorage に書かれているので、ページを離れても失われません。
+      try {
+        sessionStorage.setItem("kioku.redirecting", "1");
+      } catch (e) {}
+      kit.Au.signInWithRedirect(kit.auth, provider).catch((e) => {
+        try {
+          sessionStorage.removeItem("kioku.redirecting");
+        } catch (e2) {}
+        this.setState({ syncBusy: false, syncError: this.authErrText(e) });
+      });
+      return;
+    }
     kit.Au.signInWithPopup(kit.auth, provider).then(
       (cred) => this.afterSignIn(cred.user),
       (e) => this.setState({ syncBusy: false, syncError: this.authErrText(e) })
@@ -1260,7 +1320,8 @@ class App extends Component {
   googleLoginButton(style) {
     const s = this.state;
     // iPhone / iPad のホーム画面に追加したアプリでは、ログイン用のウィンドウを開けないことがあります。
-    const iosStandalone = navigator.standalone === true;
+    // Firebase Hosting ではリダイレクト方式なので、この心配はありません。
+    const iosStandalone = navigator.standalone === true && !onOwnHosting(this.cfg());
     return html`<div style=${{ display: "grid", gap: 8 }}>
       <button
         class="soft"
@@ -2202,6 +2263,33 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
+        ${NEW_HOME &&
+        location.hostname === OLD_HOST &&
+        html`<div
+          style=${{
+            background: C.surface,
+            border: "1px solid " + C.accent,
+            borderRadius: 14,
+            padding: "14px 16px",
+            marginBottom: 16,
+            fontSize: 13,
+            color: C.inkSoft,
+            lineHeight: 1.7,
+          }}
+        >
+          <div style=${{ fontWeight: 700, marginBottom: 4 }}>キオクは新しいアドレスに移りました</div>
+          <div>
+            ${s.syncUser
+              ? "この端末の学習データはクラウドに保存済みです。新しいアドレスを開いて、同じアカウントでログインしてください。"
+              : "この端末の学習データは、このアドレスの中にだけ保存されています。先にここでログインして同期してから、新しいアドレスを開いて同じアカウントでログインしてください。"}
+            ホーム画面に追加している場合は、新しいアドレスで追加し直してください。
+          </div>
+          <a
+            href=${NEW_HOME}
+            style=${{ display: "inline-block", marginTop: 8, color: C.accentDeep, fontWeight: 700, wordBreak: "break-all" }}
+            >${NEW_HOME}</a
+          >
+        </div>`}
         ${!s.syncUser &&
         !!this.cfg() &&
         html`<div

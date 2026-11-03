@@ -1,4 +1,4 @@
-const CACHE = 'kioku-v34';
+const CACHE = 'kioku-v35';
 const ASSETS = [
   './',
   './index.html',
@@ -45,6 +45,11 @@ self.addEventListener('fetch', (e) => {
   // 一度載ると永久に古いままです。実際にこれで「PCで作ったデッキがスマホに出てこない」
   // 状態になりました（書き込みは POST なので通り、読み取りだけが止まるので気づきにくい）。
   if (url.origin !== location.origin && CDN.indexOf(url.origin) < 0) return;
+
+  // Firebase Hosting の予約パス（/__/auth/handler、/__/auth/iframe、/__/firebase/init.json など）は
+  // 同じオリジンでも触りません。ログインの受け渡しに使うページなので、キャッシュから返すと
+  // Google ログインが古い状態のまま壊れます。
+  if (url.origin === location.origin && url.pathname.indexOf('/__/') >= 0) return;
 
   const isShell =
     url.origin === location.origin && /\/(index\.html|app\.js)?$/.test(url.pathname);

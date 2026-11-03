@@ -27,7 +27,10 @@ app.js       アプリ全体（1ファイル）。Preact + htm。
 sw.js        Service Worker。app.js/index.html は network-first、他は cache-first。
 manifest.webmanifest
 icon-*.png
-.nojekyll    GitHub Pages に Jekyll 処理をさせないための空ファイル
+.nojekyll    GitHub Pages に Jekyll 処理をさせないための空ファイル（旧サイト用）
+firebase.json                       Firebase Hosting の公開設定（キャッシュのヘッダ）
+.firebaserc                         Firebase のプロジェクトID
+.github/workflows/firebase-hosting.yml  main への push で Firebase Hosting に公開
 ```
 
 `app.js` は上から順に：定数・ユーティリティ → 旧サンプルデータの除去（`stripSample`）→ `class App`（状態・学習ロジック・同期・集計）→ 各 `renderXxx()` メソッド。
@@ -373,6 +376,8 @@ Undo（`undo()`）は `history` に評価前のカード・キュー・`tally`�
 **`sw.js` の fetch ハンドラは、同一オリジンと `CDN` に挙げた配信元だけを扱います。**
 Firebase の API（`*.googleapis.com`）はどちらでもないので、素通しでネットワークに任せます。
 `www.gstatic.com` は版を固定した SDK の配信元なので `CDN` に入れています。
+**同じオリジンでも `/__/` で始まるパスは触りません。** Firebase Hosting がログインの受け渡しに使う
+予約パス（`/__/auth/handler` など）で、キャッシュから返すと Google ログインが壊れます。
 
 一度これを外して**すべての GET をキャッシュ優先**にしていたことがあり（Supabase 時代）、取り込み（GET）が
 キャッシュに載った古い応答を返し続けました。問い合わせURLは毎回同じなので、一度載ると
@@ -393,17 +398,22 @@ Firebase の API（`*.googleapis.com`）はどちらでもないので、素通�
 
 - メール＋パスワード：`createUserWithEmailAndPassword` / `signInWithEmailAndPassword`。
   Firebase は登録と同時にログインします（確認メールは送りません）
-- Google：`signInWithPopup`。**リダイレクト方式は使いません**（Firebase Hosting 以外に置いたサイトでは
-  最近のブラウザで動かないため）。SDK を先に読み込んでおき、`signInWithGoogle()` では
-  await を挟まずにポップアップを開きます
+- Google：開いている場所で方式を変えます（`onOwnHosting()`）
+  - **Firebase Hosting（`<projectId>.web.app` / `.firebaseapp.com`）**：`signInWithRedirect`。
+    `loadFb()` が `authDomain` をいま開いているドメインに差し替えるので、ログイン処理（`/__/auth/handler`）が
+    アプリと同じドメインに載り、iPhone のホーム画面アプリでも完了します。戻ってきたことは
+    sessionStorage の `kioku.redirecting` で知り、`initSync()` が `getRedirectResult()` で結果（失敗理由も）を受け取ります
+  - **それ以外（GitHub Pages の旧サイトなど）**：`signInWithPopup`。別ドメインのリダイレクトは
+    最近のブラウザで動きません。SDK を先に読み込んでおき、await を挟まずにポップアップを開きます
 - エラーは `authErrText()` が `code` を日本語にします
 - セッションは `browserLocalPersistence`（localStorage の `firebase:authUser:…`）に置きます。
   起動時に `hasFbSession()` で同期的に「ログイン済みか」を判定し、`booting` を立てるためです
-- iOS のホーム画面に追加したアプリではポップアップが完了しないことがあるため、注記を出しています
+- iOS のホーム画面に追加したアプリではポップアップが完了しないことがあるため、ポップアップ方式のときだけ注記を出しています
 
 Firebase 側で必要な設定（コードの外）：Firestore Database を作成してルールを貼る。
 Authentication → Sign-in method で「メール / パスワード」と「Google」を有効にする。
-Authentication → 設定 → 承認済みドメインに `keijid.github.io`（ローカル確認なら `localhost`）を足す。
+Authentication → 設定 → 承認済みドメインに `keijid.github.io`（旧サイト。ローカル確認なら `localhost`）を足す。
+`<projectId>.web.app` と `.firebaseapp.com` は最初から入っています。
 
 ### 手元での確認（エミュレータ）
 
@@ -442,17 +452,30 @@ Authentication → 設定 → 承認済みドメインに `keijid.github.io`（�
 
 ## デプロイ
 
-main への push で **GitHub Pages** が自動デプロイ（Settings → Pages、Source は
-「Deploy from a branch」＝ `main` / `/ (root)`）。ビルド工程は無しのままです。
-公開URLは `https://keijid.github.io/kioku_app/` で、サブパス配信になります。
+**Firebase Hosting** に公開します（2026-11 に GitHub Pages から移行中）。ビルド工程は無しのままです。
 
-`index.html`・`manifest.webmanifest`・`sw.js` の参照はすべて `./` の相対パスです。
-**絶対パス（`/app.js` など）に書き換えないでください。** サブパス配信で壊れます。
+- main への push で `.github/workflows/firebase-hosting.yml` がリポジトリのファイルをそのまま上げます。
+  公開しないファイルは `firebase.json` の `ignore` に書きます（CLAUDE.md・README・ドットファイル）
+- 必要なもの：リポジトリの Secrets の `FIREBASE_SERVICE_ACCOUNT`（Firebase Hosting 管理者権限の
+  サービスアカウント鍵 JSON）と、`.firebaserc` のプロジェクトID。Secret が無いあいだは何もせずに終わります
+- キャッシュは `firebase.json` の `headers` で指定します。`index.html` / `*.js` / `manifest.webmanifest` / `sw.js` は
+  `no-cache`（毎回更新を確かめる）、アイコンは1日です。**`sw.js` を長くキャッシュさせないでください。**
+  Service Worker の更新が届かなくなり、古い版から抜けられなくなります
 
-GitHub Pages は `Cache-Control` ヘッダを設定できません（Netlify の `netlify.toml` で
-やっていた `no-cache` 指定は移行できないため廃止しました）。代わりに `sw.js` の
-network-first 側で `fetch(url, { cache: 'reload' })` を使い、HTTPキャッシュを迂回して
-更新を拾っています。ここを素の `fetch(e.request)` に戻さないでください。
+### 旧サイト（GitHub Pages）
+
+`https://keijid.github.io/kioku_app/`（Settings → Pages、`main` / `/ (root)`）。main から同じファイルが
+公開され続けます。**localStorage はドメインごとに別**なので、旧サイトの端末内データは新サイトから見えません。
+そのため移行期間は旧サイトも動かしたままにし、`NEW_HOME` に新しいアドレスを入れると、旧サイト
+（`OLD_HOST`）で開いたときだけホームに移転の案内が出ます（ログインして同期してから移るよう促す）。
+十分に移ったら GitHub Pages を止めます。
+
+旧サイトはサブパス配信なので、`index.html`・`manifest.webmanifest`・`sw.js` の参照はすべて `./` の相対パスです。
+**絶対パス（`/app.js` など）に書き換えないでください。** 旧サイトが壊れます。
+
+GitHub Pages は `Cache-Control` ヘッダを設定できないため、`sw.js` の network-first 側で
+`fetch(url, { cache: 'reload' })` を使い、HTTPキャッシュを迂回して更新を拾っています。
+ここを素の `fetch(e.request)` に戻さないでください。
 
 **変更を出すときのチェックリスト**
 1. `app.js`（必要なら `index.html`）を編集
