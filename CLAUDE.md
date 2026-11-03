@@ -48,7 +48,7 @@ icon-*.png
   メディアクエリは使っていません。
 - **`class App` に生やすインスタンス変数は `_` 1つ始まりの短い名前を避けてください。**
   Preact は Component インスタンスに自分の内部プロパティを書き込むため、名前が衝突すると
-  こちらが入れた値が黙って別のものに置き換わります。実際に `this._sb`（Supabase クライアント）が
+  こちらが入れた値が黙って別のものに置き換わります。実際に `this._sb`（当時の Supabase クライアント）が
   これで壊れ、同期のログインができなくなりました。用途がわかる長めの名前（`_sbClient` など）にし、
   使い回す前に中身を確認するようにしてください。
 - **メソッド名も同じです。Preact の `Component` が持つ名前を使わないでください**
@@ -79,9 +79,9 @@ gradeTotals = { again, hard, good, easy }  // 累計（正答率の算出用）
 
 **localStorage のキー**
 - `kioku.mvp.v1` — decks / cards / log / gradeTotals / todayCount
-- `kioku.sync.cfg` — Supabase の URL と publishable key（端末で保存先を上書きしたときだけ入ります）
+- `kioku.sync.cfg` — Firebase の firebaseConfig（端末で保存先を上書きしたときだけ入ります）
 - `kioku.sync.*` — 同期の控え（「同期」の節にまとめてあります）
-- `kioku.sb.auth` — Supabase のセッション（Supabase SDK が管理）
+- `firebase:authUser:…` — Firebase のセッション（Firebase SDK が管理）
 - `kioku.localonly` — 入口で「ログインせずにこの端末だけで使う」を選んだ（`"1"`）
 
 保存は `this.persist(next)` を呼びます。localStorage への書き込みとクラウドへの遅延プッシュを兼ねています。
@@ -237,57 +237,82 @@ Undo（`undo()`）は `history` に評価前のカード・キュー・`tally`�
 
 キーボード操作：Space / Enter でめくる・「できた」、1〜4 で各評価。`onKey()` を参照。
 
-## 同期（Supabase・任意）
+## 同期（Firebase・任意）
 
 未設定でもアプリは完全に動きます（端末内保存のみ）。設定した場合：
 
-- 保存先（Project URL と publishable key）は `app.js` の `DEFAULT_SB` に持たせています。
-  利用者が入力するのはメールとパスワードだけです。`DEFAULT_SB` が空のときだけ、
-  同期画面の「別の保存先を使う」から手入力する従来の流れになります
-- `cfg()` は「端末で保存した設定 → `DEFAULT_SB`」の順に返します。localStorage の形式は変えていません
-- Supabase JS SDK は同期を初めて使うときに動的 import します（初期表示を軽くするため）
-- 認証はメール＋パスワードと、Google ログイン（下の節）
-- キーは **publishable key**（`sb_publishable_…`／旧 anon key）。secret key は絶対に使わないこと
-- セットアップSQLは `app.js` の `SQL_SETUP` にあり、アプリ内に表示されます
+- 保存先（firebaseConfig の `apiKey` `authDomain` `projectId` `appId`）は `app.js` の `DEFAULT_FB` に持たせています。
+  利用者がするのはログインだけです。`DEFAULT_FB` が空のときだけ、同期画面の
+  「別の保存先を使う」に firebaseConfig を貼る流れになります（`parseFbConfig()` が値を抜き出します）
+- `cfg()` は「端末で保存した設定 → `DEFAULT_FB`」の順に返します。`kioku.sync.cfg` に Supabase 時代の
+  `{url, key}` が残っていても、`apiKey` と `projectId` が揃っていないものは使いません
+- Firebase SDK（app / auth / firestore）は `FB_SOURCES` から動的 import します。版は `FB_VER` で固定。
+  **3つは必ず同じ配信元・同じ版から読み込むこと**（混ぜると別物の app を掴みます）
+- SDK は起動時に（未ログインでも）読み込みます。Google ログインのポップアップは押した直後に
+  開かないとブラウザに止められるので、押してから読み込むのでは間に合わないためです
+- `apiKey` はブラウザに配られる公開の値です。実際の保護は Firestore のルール（`RULES_SETUP`）が担います
+- ルールは `app.js` の `RULES_SETUP` にあり、アプリ内に表示されます
 
-### かたち：カード1枚が1行
+### 2026-11 に Supabase から移りました
 
-同期の実体は **`kioku_items`**（`user_id` + `kind` + `item_id` が主キー）です。
-`kind` は `deck` / `card` / `log` / `grade`。RLSで本人のみ読み書き可。
+それまでは Supabase（`kioku_items` テーブル）でした。移行のしかた：
 
-**1行の JSON に全部を入れていた頃（`kioku_state`）に何が起きたかを、必ず読んでください。**
+- **データはクラウド間で移していません。** 各端末が `kioku.mvp.v1` に全部を持っているので、
+  新しい版を開いた端末がログインすると、手元の全項目が Firebase へ送られます（＝引っ越し）
+- 新しい版を初めて開いたとき `moveFromSupabase()` が1回だけ（`kioku.sync.backend`）、
+  Supabase 宛ての控え（cursor / shadow / legacy / at / `kioku.sb.auth` / Supabase 形式の `kioku.sync.cfg`）を捨てます。
+  **`kioku.mvp.v1`・`kioku.sync.counts`・`kioku.sync.device` は残します**
+- Supabase でログインしていた端末には、ホームの帯で「もう一度ログインしてください」と出します（`kioku.sync.moved`）。
+  アカウントは引き継がれないので、メールで使っていた人は新規登録し直しです
+- 学習枚数は `seedCounts()` で持ち込みます（下の「学習枚数と評価の累計」）
+- 2台目以降の端末がログインしたときは、`applyRows()` が「控えに無い項目は相手を優先」するので、
+  先に移った端末の内容と自然に合わさります
+
+### かたち：カード1枚が1ドキュメント
+
+同期の実体は **`users/{uid}/items/{kind:item_id}`** です（`docId()`）。
+中身は `{ kind, item_id, data, deleted_at, updated_at }`。`kind` は `deck` / `card` / `log` / `grade`。
+ルールで本人のみ読み書き可。
+
+**1つの JSON に全部を入れていた頃（Supabase の `kioku_state`）に何が起きたかを、必ず読んでください。**
 まるごと置き換えなので、別々のカードを触っただけで衝突し、「相手に無い」が削除なのか
 未着信なのか判別できず、壊れた端末が1回上書きすると全部飛びました。実際に全部起きました。
-行に分けたことで、この3つが同時に解けています。
+1件1ドキュメントに分けたことで、この3つが同時に解けています。
 
 | 仕組み | 何が解決したか |
 | --- | --- |
-| 1件1行 | 別々のカードを触っているかぎり、そもそも衝突しない |
+| 1件1ドキュメント | 別々のカードを触っているかぎり、そもそも衝突しない |
 | `deleted_at`（墓標） | 削除が**データ**になる。「消したのか未着信か」を推測しなくてよい |
-| `updated_at` をトリガでサーバが打つ | 端末の時計がずれても順序が壊れない |
-| `updated_at > cursor` で取得 | 変わった行だけを取る。4000枚あっても毎回は取らない |
+| `updated_at` は `serverTimestamp()`、ルールで `request.time` 以外を拒否 | 端末の時計がずれても順序が壊れない |
+| `updated_at` → ドキュメントID の順で続きから取得 | 変わったものだけを取る。4000枚あっても毎回は取らない |
 
-**行を物理削除しないでください。** 消すと、削除したことが誰にも伝わりません。
-
-`kioku_state` は**移行元として読むだけで、消さずに残します。** 移行がうまくいかなかった
-ときの逃げ道であり、まだ更新していない端末が書いた分をここから拾えるためです
-（`migrateLegacy()`。すでに行がある項目は上書きしないので、消したものは生き返りません）。
+**ドキュメントを削除しないでください。** ルールでも `allow delete: if false` にしてあります。
+消すと、削除したことが誰にも伝わりません。
 
 ### 送るもの・受け取るもの
 
 - **送る**：`pending()` が「控え（`kioku.sync.shadow`）」と今の中身を比べて差分を出します。
   控えは中身そのものではなく**短いハッシュ**です。4000枚ぶんの本体を二重に置くと
-  localStorage の容量が足りません
+  localStorage の容量が足りません。送信は `writeBatch` で 400 件ずつです（上限 500）
 - **受け取る**：`applyRows()` が唯一の入口です。`pull()`（差分取得）からも
-  realtime からもここを通します
+  realtime（`onSnapshot`）からもここを通します。ドキュメントは `fbRow()` で行の形にしてから渡します
 - **行の中身の形は `deckRow()` / `cardRow()` が唯一の定義**です。送信と控えで形がずれると、
   毎回「変わった」と誤判定して送り返しが止まりません。値を必ず埋めているのも同じ理由です
 
 ### 踏むと壊れるところ
 
+- **取り込みの位置（cursor）は時刻だけでなく「時刻｜ドキュメントID」です（`posOf()` / `splitPos()`）。**
+  `writeBatch` でまとめて書いた項目は**全部同じ `updated_at`** になります。時刻だけで
+  「これより後」を取ると、1000件の区切りが同じ時刻の途中に来たとき、残りを取りこぼします。
+  `orderBy("updated_at")` → `orderBy(documentId())` と `startAfter(時刻, ID)` で、ちょうど続きから取ります。
+  ID が空のときは `startAfter(時刻)` だけにすること（空の ID は Firestore が受け付けません）
+- **取得は `getDocsFromServer()` を使ってください。** `getDocs()` は端末内キャッシュから
+  返すことがあり、古い内容のまま「取り込めた」ことになります
+- **Firestore の端末内キャッシュ（persistentLocalCache）は使いません。** 手元の正は
+  `kioku.mvp.v1` で、置き場所を二つにすると食い違います
 - **比較は `canon()` を使ってください。素の `JSON.stringify` はだめです。**
-  Postgres の jsonb はキーの順を並べ替えて返すので、中身が同じでも「変わった」ことになり、
-  送り返しが延々と続きます
+  クラウドから戻ってきた中身はキーの順が並べ替わっていることがあり、中身が同じでも
+  「変わった」ことになって、送り返しが延々と続きます
 - **同期が見る「いまの手元の内容」は `savedData()`（localStorage）です。`this.state` ではありません。**
   Preact の `setState` は次の描画まで `this.state` を書き換えないので、取り込んだ直後に
   state を見ると空のままです。そこで差分を取ると全項目が「消された」ことになり、
@@ -298,29 +323,43 @@ Undo（`undo()`）は `history` に評価前のカード・キュー・`tally`�
 - **送信中に触っていた項目を、相手の内容で潰さないでください。** `applyRows()` は
   未送信（dirty）の項目を飛ばします。カードだけは学習の進み具合を `pickCard()` で
   進んでいる方に寄せます
+- **ただし、この端末から一度も送っていない項目（控えに無い）は相手を優先します。**
+  ログインし直した直後や保存先を移した直後は控えが空なので、手元の全項目が「未送信」に見えます。
+  そこで手元を優先すると、他の端末で消したものを送り返して生き返らせます（カードの進み具合だけは `pickCard()`）
+- realtime では、自分が書いた直後のサーバ未着の版（`hasPendingWrites`）を飛ばします。`updated_at` がまだ無いためです
 
 ### 学習枚数と評価の累計
 
-**端末ごとに1行**持ち（`log:<端末ID>` / `grade:<端末ID>`）、表示は全部の合計にします。
+**端末ごとに1ドキュメント**持ち（`log:<端末ID>` / `grade:<端末ID>`）、表示は全部の合計にします。
 足し算なので、同じ日に2台で学習しても正しく合算されます。
 
 「この端末のぶん」は **合計 −（他の端末＋legacy）** で出せるので（`myCounts()`）、
 学習のたびにカウンタを別途触る必要がありません。`rate()` は今までどおりです。
 
-移行時の履歴は `log:legacy` / `grade:legacy` という**1行**にまとめます。
+- 受け取ったときの合計は、**この端末のぶんだけ受け取る前の値（`mineNow`）で計算します**（`applyRows()`）。
+  受け取った行は「最後に送った値」なので、まだ送っていない直前の学習が入っておらず、
+  他の端末の行が届いた瞬間に今日の枚数が消えていました
+- **内訳（`kioku.sync.counts`）はログアウトでも捨てません。** 手元の合計は全端末の合計なので、
+  内訳が無いと「この端末のぶん」が合計そのものになり、再ログインで二重に数えます
+- `seedCounts()` はユーザーごとに1回（`kioku.sync.seeded`）、自分のぶんを必ず送り、
+  他の端末と legacy のぶんはクラウドに無いときだけ送ります。`push()` は控えと変わったときしか
+  送らないので、移ってきた直後の自分のぶんはこれが無いと一度も送られません
+
+`log:legacy` / `grade:legacy` は Supabase の `kioku_state` 時代の履歴を1つにまとめたものです。
 端末ごとに持たせると、どの端末も同じ履歴を「自分のぶん」と主張して二重に数えます。
 
 ### 即時反映（realtime）
 
-`subscribeRealtime()` が `kioku_items` の変更を購読し、届いた行を `applyRows()` に流します。
-接続できなくても60秒ごとの見直しで追いつくので、**失敗しても黙って続行します**。
+`subscribeRealtime()` が `onSnapshot` で `updated_at > cursor` の変更を購読し、`applyRows()` に流します。
+**cursor は進めません**（届いた行より古い未取得の行を取りこぼすため。取りこぼし防止は `pull()` の役目）。
+学習中は反映しません。接続できなくても60秒ごとの見直しで追いつくので、**失敗しても黙って続行します**。
 
 ### 同期がいつ走るか
 
 | きっかけ | すること |
 | --- | --- |
 | ログイン・起動時のセッション復元 | 差分取得＋購読開始 |
-| 相手の端末が書いたとき（realtime） | その行だけ反映 |
+| 相手の端末が書いたとき（realtime） | その項目だけ反映 |
 | 学習・編集のたび | 2.5秒後に差分送信（`queuePush()`） |
 | 画面を離れる／戻る、回線が戻る | 送信、戻るときは取得も |
 | 60秒ごと | 送るものがあれば送信、無ければ取得。ログインを掴めていなければ `initSync()` をやり直す |
@@ -332,9 +371,10 @@ Undo（`undo()`）は `history` に評価前のカード・キュー・`tally`�
 ### Service Worker に同期の通信を触らせないこと
 
 **`sw.js` の fetch ハンドラは、同一オリジンと `CDN` に挙げた配信元だけを扱います。**
-Supabase の API はどちらでもないので、素通しでネットワークに任せます。
+Firebase の API（`*.googleapis.com`）はどちらでもないので、素通しでネットワークに任せます。
+`www.gstatic.com` は版を固定した SDK の配信元なので `CDN` に入れています。
 
-一度これを外して**すべての GET をキャッシュ優先**にしていたことがあり、取り込み（GET）が
+一度これを外して**すべての GET をキャッシュ優先**にしていたことがあり（Supabase 時代）、取り込み（GET）が
 キャッシュに載った古い応答を返し続けました。問い合わせURLは毎回同じなので、一度載ると
 永久に古いままです。しかも**書き込みは POST なので通り、読み取りだけが止まる**ため、
 「PCで作ったデッキがスマホにいつまでも出てこない」という、アプリ側をいくら直しても
@@ -343,43 +383,48 @@ Supabase の API はどちらでもないので、素通しでネットワーク
 
 `CDN` に足してよいのは**内容が変わらないもの**だけです（SDK、フォント）。API を足さないこと。
 
-### SQL をまだ実行していないとき
+### Firestore の準備がまだのとき
 
-`kioku_items` が無いと PostgREST は `PGRST205` を返します。`needsSetup()` がそれを見て、
-同期画面に SQL を出し、「実行するまで端末内にだけ保存されます」と伝えます（`syncFail()`）。
+データベースが無い・ルールが既定（ロックモード）のままだと `permission-denied` / `not-found` が返ります。
+`needsSetup()` がそれを見て、同期画面にルールを出し、「それまで端末内にだけ保存されます」と伝えます（`syncFail()`）。
 **この経路を消さないでください。** 黙って失敗すると、利用者は同期が壊れたと思います。
 
-### Google ログイン
+### ログイン
 
-Supabase の OAuth（`signInWithOAuth`）を使います。`signInWithGoogle()` がページごと Google へ移動し、
-終わると `redirectTo`（`location.origin + location.pathname`）に `?code=` 付きで戻ってきます。
+- メール＋パスワード：`createUserWithEmailAndPassword` / `signInWithEmailAndPassword`。
+  Firebase は登録と同時にログインします（確認メールは送りません）
+- Google：`signInWithPopup`。**リダイレクト方式は使いません**（Firebase Hosting 以外に置いたサイトでは
+  最近のブラウザで動かないため）。SDK を先に読み込んでおき、`signInWithGoogle()` では
+  await を挟まずにポップアップを開きます
+- エラーは `authErrText()` が `code` を日本語にします
+- セッションは `browserLocalPersistence`（localStorage の `firebase:authUser:…`）に置きます。
+  起動時に `hasFbSession()` で同期的に「ログイン済みか」を判定し、`booting` を立てるためです
+- iOS のホーム画面に追加したアプリではポップアップが完了しないことがあるため、注記を出しています
 
-- クライアントは `flowType: "pkce"` で作ります。戻ってきた `?code=` は `initSync()` の
-  `getSession()` の中で SDK がセッションに交換します（`detectSessionInUrl` は既定で有効）
-- 戻ってきたときは `componentDidMount()` で `oauthReturn()` が URL を見て `booting` を立てます。
-  交換が終わったら `clearOauthParams()` で URL から `?code=` を消します（残すと再読み込みで使用済みのコードを交換しようとして失敗します）
-- Google 側でキャンセルすると `?error=` 付きで戻るので、その旨を `syncError` に出します
-- ボタンは `checkGoogleAuth()` が Supabase の公開設定（`/auth/v1/settings`）を見て、
-  **Google が無効な保存先では出しません。** 押すと Supabase の英語のエラーページに飛ばされるためです。
-  確かめられないとき（オフラインなど）は出しておきます
-- 同じメールアドレスの既存アカウントには Supabase が自動で紐づけるので、メールで作ったデータがそのまま見えます
-- iOS のホーム画面に追加したアプリでは、外部サイトでのログイン結果をアプリへ持ち帰れないことがあるため、注記を出しています
+Firebase 側で必要な設定（コードの外）：Firestore Database を作成してルールを貼る。
+Authentication → Sign-in method で「メール / パスワード」と「Google」を有効にする。
+Authentication → 設定 → 承認済みドメインに `keijid.github.io`（ローカル確認なら `localhost`）を足す。
 
-Supabase 側で必要な設定（コードの外）：Authentication → Sign In / Providers → Google を有効にして
-Google Cloud の OAuth クライアント ID / シークレットを入れる。Authentication → URL Configuration の
-Redirect URLs に `https://keijid.github.io/kioku_app/**`（ローカル確認なら `http://localhost:8000/**` も）を足す。
+### 手元での確認（エミュレータ）
+
+`window.KIOKU_EMULATOR` を立てると、`loadFb()` が Auth（127.0.0.1:9099）と Firestore（127.0.0.1:8080）の
+エミュレータへ繋ぎます。firebase-tools はリポジトリに入れず、一時フォルダで動かしてください
+（`firebase emulators:start --project demo-kioku --only auth,firestore`、ルールは `RULES_SETUP` を書き出したもの）。
 
 ### localStorage のキー（同期用）
 
 - `kioku.sync.device` — この端末の名札（学習枚数の集計に使用）
-- `kioku.sync.cursor` — どこまで取り込んだか（サーバの `updated_at`）
+- `kioku.sync.cursor` — どこまで取り込んだか（`posOf()` の形）
 - `kioku.sync.shadow` — 送信済みの控え（項目ごとの短いハッシュ）
-- `kioku.sync.counts` — 受け取った学習枚数・評価の行
-- `kioku.sync.legacy` — `kioku_state` からどこまで移行したか
+- `kioku.sync.counts` — 受け取った学習枚数・評価の内訳（ログアウトでも残す）
+- `kioku.sync.seeded` — `seedCounts()` を済ませたユーザー
 - `kioku.sync.at` — 最終同期時刻（表示用）
+- `kioku.sync.backend` — `"firebase"`。Supabase からの移行を済ませた印
+- `kioku.sync.moved` — Supabase でログインしていた端末。ホームで再ログインを促す
+- `firebase:authUser:…` — Firebase のセッション（SDK が管理）
 
-ログアウトと接続解除では `forgetSyncState()` でこれらを捨てます。
-**学習データ（`kioku.mvp.v1`）には触りません。**
+ログアウトと接続解除では `forgetSyncState()` で控え（at / cursor / shadow / seeded など）を捨てます。
+**学習データ（`kioku.mvp.v1`）と内訳（`kioku.sync.counts`）には触りません。**
 
 ## 入口（ログイン画面）
 
@@ -391,7 +436,7 @@ Redirect URLs に `https://keijid.github.io/kioku_app/**`（ローカル確認�
   ログインを促した結果、手元のデータが見えなくなる事故を防ぐためです
 - 「ログインせずにこの端末だけで使う」を押すと `kioku.localonly` が立ち、以後は素通しになります。
   ホームの上部に出る1行バナーからいつでもログイン画面に戻れます
-- `kioku.sb.auth` が残っている端末は `booting` を立てて、セッション復元が終わるまで「読み込み中…」を出します。
+- Firebase のセッション（`hasFbSession()`）が残っている端末は `booting` を立てて、セッション復元が終わるまで「読み込み中…」を出します。
   これをしないと、ログイン済みの端末でログイン画面が一瞬ちらつきます
 - ログアウトしても手元の学習データ（`kioku.mvp.v1`）は消しません。入口に戻すだけです
 

@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v33";
+const BUILD = "v34";
 
 const C = {
   bg: "#F3EFE6",
@@ -30,71 +30,101 @@ const C = {
   green: "#3E7C6B",
 };
 
-// Supabase SDK の読み込み元。上から順に試し、ちゃんと動くクライアントが作れたものを使います。
-// バージョンを固定しているのは、@2 のまま最新に追随させると CDN 側の変更だけで
-// ある日突然ログインできなくなるためです。最後の1つだけ最新版を保険に残しています。
-const SB_SOURCES = [
-  "https://esm.sh/@supabase/supabase-js@2.45.4",
-  "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm",
-  "https://esm.sh/@supabase/supabase-js@2",
+// Firebase SDK の読み込み元。上から順に試し、3つ（app / auth / firestore）が揃って
+// 動いたものを使います。3つは必ず同じ配信元・同じ版から読み込むこと（混ぜると別物の
+// app を掴んで「初期化されていない」と言われます）。
+// バージョンを固定しているのは、CDN 側の更新だけで、ある日突然ログインできなくなるのを避けるためです。
+const FB_VER = "10.14.1";
+const FB_SOURCES = [
+  {
+    app: "https://www.gstatic.com/firebasejs/" + FB_VER + "/firebase-app.js",
+    auth: "https://www.gstatic.com/firebasejs/" + FB_VER + "/firebase-auth.js",
+    store: "https://www.gstatic.com/firebasejs/" + FB_VER + "/firebase-firestore.js",
+  },
+  {
+    app: "https://esm.sh/firebase@" + FB_VER + "/app",
+    auth: "https://esm.sh/firebase@" + FB_VER + "/auth",
+    store: "https://esm.sh/firebase@" + FB_VER + "/firestore",
+  },
 ];
 
-// 既定の保存先。ここに値を入れておくと、利用者は接続情報を貼らずメールとパスワードだけで始められます。
-// publishable key はブラウザに配られる公開キーで、実際の保護は kioku_items の RLS（SQL_SETUP）が担っています。
-// secret key は絶対に置かないこと。空のままなら、従来どおり画面から保存先を手入力します。
-const DEFAULT_SB = {
-  url: "https://iakueghsgrcxcdsqtdxt.supabase.co",
-  key: "sb_publishable_1s3ilko2FhbU2MbDi4KfBg_PMalXS4f",
+// 既定の保存先。Firebase コンソールの「プロジェクトの設定 → マイアプリ → SDK の設定と構成」に出る
+// firebaseConfig の値です。ここに入れておくと、利用者はログインするだけで始められます。
+// apiKey はブラウザに配られる公開の値で、実際の保護は Firestore のルール（RULES_SETUP）が担っています。
+// 空のままなら同期は使えず、アプリは端末内保存だけで動きます。
+const DEFAULT_FB = {
+  apiKey: "",
+  authDomain: "",
+  projectId: "",
+  appId: "",
 };
 
-// 同期の実体はカード・デッキ1件につき1行の kioku_items です。
-// 1行の JSON にまとめて入れていた頃は、別々のカードを触っただけで衝突し、
-// 「相手に無い」が削除なのか未着信なのか判別できませんでした。行に分け、
-// 削除を deleted_at で明示し、更新時刻をサーバに打たせることで、その3つを同時に解きます。
-// kioku_state は移行元としてだけ読みます（消さずに残す＝手動の逃げ道）。
-const SQL_SETUP = [
-  "create table if not exists kioku_state (",
-  "  user_id uuid primary key references auth.users on delete cascade,",
-  "  data jsonb not null,",
-  "  updated_at timestamptz not null default now()",
-  ");",
-  "alter table kioku_state enable row level security;",
-  'drop policy if exists "own rows" on kioku_state;',
-  'create policy "own rows" on kioku_state',
-  "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);",
-  "",
-  "-- ここから下が新しい同期用です。上と一緒にそのまま実行してください。",
-  "create table if not exists kioku_items (",
-  "  user_id uuid not null references auth.users on delete cascade,",
-  "  kind text not null,",
-  "  item_id text not null,",
-  "  data jsonb,",
-  "  deleted_at timestamptz,",
-  "  updated_at timestamptz not null default now(),",
-  "  primary key (user_id, kind, item_id)",
-  ");",
-  "",
-  "-- 更新時刻は必ずサーバが打ちます。端末の時計がずれていても順序が壊れません。",
-  "create or replace function kioku_touch() returns trigger as $$",
-  "begin",
-  "  new.updated_at = now();",
-  "  return new;",
-  "end $$ language plpgsql;",
-  "drop trigger if exists kioku_items_touch on kioku_items;",
-  "create trigger kioku_items_touch before insert or update on kioku_items",
-  "  for each row execute function kioku_touch();",
-  "",
-  "create index if not exists kioku_items_sync on kioku_items (user_id, updated_at);",
-  "alter table kioku_items enable row level security;",
-  'drop policy if exists "own rows" on kioku_items;',
-  'create policy "own rows" on kioku_items',
-  "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);",
-  "",
-  "-- 変更を他の端末へ即時に流すための購読設定（2回実行しても平気です）。",
-  "do $$ begin",
-  "  alter publication supabase_realtime add table kioku_items;",
-  "exception when duplicate_object then null; end $$;",
+// Firestore のルール。Firebase コンソールの Firestore Database → ルール に貼って公開します。
+// - 自分の users/{uid} の下しか読み書きできません
+// - updated_at はサーバの時刻（serverTimestamp）でなければ書けません。端末の時計に依存しないためです
+// - **削除は禁止です。** 削除は deleted_at を立てて表します（墓標）。ドキュメントを消すと、
+//   消したことが他の端末に伝わりません
+const RULES_SETUP = [
+  "rules_version = '2';",
+  "service cloud.firestore {",
+  "  match /databases/{database}/documents {",
+  "    match /users/{uid}/items/{item} {",
+  "      allow read: if request.auth != null && request.auth.uid == uid;",
+  "      allow create, update: if request.auth != null && request.auth.uid == uid",
+  "        && request.resource.data.updated_at == request.time;",
+  "      allow delete: if false;",
+  "    }",
+  "  }",
+  "}",
 ].join("\n");
+
+// Firestore のドキュメントID。kind と項目のIDをつなぎます。
+// ID に "/" が入ると階層の区切りとみなされるので、念のため符号化します。
+function docId(kind, itemId) {
+  return kind + ":" + encodeURIComponent(String(itemId));
+}
+
+// 取り込みの位置（cursor）。「サーバが打った時刻｜ドキュメントID」を、文字列の大小で
+// 前後が比べられる形にします（秒は12桁、ナノ秒は9桁にゼロ埋め）。
+function posOf(ts, id) {
+  const sec = ts ? ts.seconds : 0;
+  const ns = ts ? ts.nanoseconds : 0;
+  return String(sec).padStart(12, "0") + "." + String(ns).padStart(9, "0") + "|" + (id || "");
+}
+
+// posOf() の逆。Firestore の問い合わせに渡せる Timestamp と ID に戻します。
+function splitPos(F, pos) {
+  const bar = pos.indexOf("|");
+  const t = pos.slice(0, bar).split(".");
+  return { ts: new F.Timestamp(Number(t[0]) || 0, Number(t[1]) || 0), id: pos.slice(bar + 1) };
+}
+
+// Firestore のドキュメントを、applyRows() が受け取る行の形にします。
+// updated_at がまだ無い（サーバに届く前の）ものは、順序が決まらないので捨てます。
+function fbRow(id, d) {
+  if (!d || !d.kind || !d.updated_at || typeof d.updated_at.toDate !== "function") return null;
+  return {
+    kind: d.kind,
+    item_id: d.item_id,
+    data: d.data || null,
+    deleted_at: d.deleted_at ? true : null,
+    pos: posOf(d.updated_at, id),
+    at: d.updated_at.toDate().toISOString(),
+  };
+}
+
+// 「別の保存先を使う」に貼られた firebaseConfig から、必要な値だけを抜き出します。
+// JSON でも、コンソールに出る JavaScript の書き方（キーに引用符なし）でも読めるようにしています。
+function parseFbConfig(text) {
+  const pick = (k) => {
+    const m = String(text).match(new RegExp("[\"']?" + k + "[\"']?\\s*:\\s*[\"']([^\"']+)[\"']"));
+    return m ? m[1].trim() : "";
+  };
+  const out = { apiKey: pick("apiKey"), authDomain: pick("authDomain"), projectId: pick("projectId"), appId: pick("appId") };
+  if (!out.apiKey || !out.projectId) return null;
+  if (!out.authDomain) out.authDomain = out.projectId + ".firebaseapp.com";
+  return out;
+}
 
 function dayKey(t) {
   const d = new Date(t);
@@ -307,7 +337,7 @@ function cardRow(c) {
   };
 }
 
-// キーの順に依存しない文字列化。Postgres の jsonb はキーの順を並べ替えて返すので、
+// キーの順に依存しない文字列化。クラウドから戻ってきた中身はキーの順が並べ替わっていることがあるので、
 // 素の JSON.stringify で比べると、中身が同じでも「変わった」ことになってしまいます。
 function canon(v) {
   if (v === null || v === undefined) return "null";
@@ -398,8 +428,7 @@ class App extends Component {
     impSkipDup: true,
     lastImport: null, // { ids, deckId, deckName, deckCreated }
     // 同期
-    sbUrl: "",
-    sbKey: "",
+    fbCfgText: "", // 「別の保存先を使う」に貼る firebaseConfig
     syncEmail: "",
     syncPw: "",
     syncUser: null,
@@ -410,9 +439,9 @@ class App extends Component {
     booting: false, // 保存済みセッションの復元待ち。ログイン画面のちらつき防止
     localOnly: false, // 「この端末だけで使う」を選んだ
     authMode: "in", // ログイン画面のタブ "in" | "up"
-    googleAuth: null, // 保存先で Google ログインが有効か（null = 未確認。false のときだけボタンを隠す）
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
-    sqlNeeded: false, // kioku_items がまだ無い（SQL 未実行）ので、SQL を出す
+    movedBackend: false, // Supabase から移った直後で、まだ Firebase にログインしていない
+    rulesNeeded: false, // Firestore の準備（データベース作成・ルール）がまだなので、ルールを出す
   };
 
   componentDidMount() {
@@ -503,7 +532,7 @@ class App extends Component {
       // SDK の読み込みやセッション復元に一度失敗すると、その端末はログイン状態を
       // 掴めないまま同期しなくなります（やり直す機会がどこにも無かった）。時々やり直します。
       if (!this._syncUserEmail) {
-        if (this.cfg() && localStorage.getItem("kioku.sb.auth")) this.initSync();
+        if (this.cfg() && this.hasFbSession()) this.initSync();
         return;
       }
       if (!this.canSyncNow()) return;
@@ -511,25 +540,41 @@ class App extends Component {
       else if (document.visibilityState === "visible") this.pull(true);
     }, 60000);
 
+    this.moveFromSupabase();
     const c = this.cfg();
-    if (c) this.setState({ sbUrl: c.url, sbKey: c.key, syncAt: localStorage.getItem("kioku.sync.at") });
+    if (c) this.setState({ syncAt: localStorage.getItem("kioku.sync.at") });
     // セッションが残っていれば復元が終わるまで待つ。ログイン済みの端末に
     // ログイン画面が一瞬映らないようにするためです（SDK は CDN から非同期に読み込むので）。
-    const hasSession = !!localStorage.getItem("kioku.sb.auth");
-    // Google ログインから戻ってきたところか。URL に ?code= が付いていれば、SDK がそれを
-    // セッションに交換するまで「読み込み中…」を出します（ログイン画面のちらつき防止）。
-    const ret = this.oauthReturn();
-    this._oauthReturning = ret.code;
-    this._oauthError = ret.error;
-    this._hadStoredSession = hasSession || ret.code;
+    const hasSession = this.hasFbSession();
+    this._hadStoredSession = hasSession;
     this.setState({
       localOnly: localStorage.getItem("kioku.localonly") === "1",
-      booting: !!c && (hasSession || ret.code),
-      syncError: ret.error,
+      booting: !!c && hasSession,
+      movedBackend: localStorage.getItem("kioku.sync.moved") === "1",
     });
-    if (ret.error) this.clearOauthParams();
+    // セッションが無くても SDK は先に読み込んでおきます。Google ログインのポップアップは
+    // ボタンを押した直後に開かないとブラウザに止められるためです（signInWithGoogle の説明）。
     this.initSync();
-    this.checkGoogleAuth();
+  }
+
+  // 保存先を Supabase から Firebase へ移した版を、初めて開いたときに1回だけ行います。
+  // Supabase 宛ての控え（どこまで送った・どこまで取った）は Firebase では意味が無いので捨てます。
+  // 控えが空になるので、ログインすると手元の全項目が Firebase へ送られます（＝データの引っ越し）。
+  // **学習データ（kioku.mvp.v1）と学習枚数の行（kioku.sync.counts）、端末の名札は残します。**
+  // counts は seedCounts() で Firebase へ持ち込みます。捨てると他の端末のぶんの学習枚数が消えます。
+  moveFromSupabase() {
+    if (localStorage.getItem("kioku.sync.backend") === "firebase") return;
+    const wasIn = !!localStorage.getItem("kioku.sb.auth");
+    ["kioku.sync.at", "kioku.sync.cursor", "kioku.sync.shadow", "kioku.sync.legacy", "kioku.sync.base", "kioku.sb.auth"].forEach(
+      (k) => localStorage.removeItem(k)
+    );
+    try {
+      const saved = JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
+      if (saved && saved.url) localStorage.removeItem("kioku.sync.cfg"); // Supabase の保存先
+    } catch (e) {}
+    // Supabase でログインしていた人には、ホームの帯で「もう一度ログインして」と伝えます。
+    if (wasIn) localStorage.setItem("kioku.sync.moved", "1");
+    localStorage.setItem("kioku.sync.backend", "firebase");
   }
 
   componentWillUnmount() {
@@ -826,22 +871,24 @@ class App extends Component {
     return d === 1 ? "明日" : d + "日後";
   }
 
-  // ---- クラウド同期（Supabase・任意） ----
+  // ---- クラウド同期（Firebase・任意） ----
 
-  // 保存先。端末で設定したものがあればそれを、なければ DEFAULT_SB を使います。
+  // 保存先。端末で設定したものがあればそれを、なければ DEFAULT_FB を使います。
+  // kioku.sync.cfg には Supabase 時代の {url, key} が残っていることがあるので、
+  // Firebase の形（apiKey と projectId）が揃っているものだけを採ります。
   cfg() {
     try {
       const saved = JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
-      if (saved && saved.url && saved.key) return saved;
+      if (saved && saved.apiKey && saved.projectId) return saved;
     } catch (e) {}
-    return DEFAULT_SB.url && DEFAULT_SB.key ? DEFAULT_SB : null;
+    return DEFAULT_FB.apiKey && DEFAULT_FB.projectId ? DEFAULT_FB : null;
   }
 
   // 端末で保存先を上書きしているか（同期画面で「別の保存先」の表示を出し分けるのに使います）。
   hasOwnCfg() {
     try {
       const saved = JSON.parse(localStorage.getItem("kioku.sync.cfg") || "null");
-      return !!(saved && saved.url && saved.key);
+      return !!(saved && saved.apiKey && saved.projectId);
     } catch (e) {
       return false;
     }
@@ -853,20 +900,25 @@ class App extends Component {
     if (this.state.localOnly) this.setState({ localOnly: false });
   }
 
-  // kioku_items がまだ無い＝SQL を実行していないとき。原因が分かる文言に差し替えます。
-  // PostgREST はテーブルが無いと PGRST205（schema cache に無い）を返します。
+  // Firestore を作っていない、またはルールを貼っていないとき。
+  // 既定のルール（ロックモード）では読み書きとも permission-denied になり、
+  // データベース自体が無いと not-found / failed-precondition が返ります。
   needsSetup(e) {
-    const m = String((e && (e.message || e.details || e.code)) || e);
-    return /kioku_items/.test(m) && /(does not exist|42P01|PGRST205|schema cache)/i.test(m);
+    const code = String((e && e.code) || "");
+    const m = String((e && e.message) || "");
+    return (
+      /permission-denied|not-found|failed-precondition/.test(code) ||
+      /Missing or insufficient permissions|database \(default\) does not exist/i.test(m)
+    );
   }
 
   syncFail(e) {
     if (this.needsSetup(e)) {
       this.setState({
-        sqlNeeded: true,
+        rulesNeeded: true,
         syncError:
-          "同期の準備がまだ終わっていません。この画面の下に出ているSQLを Supabase の SQL Editor で実行してください（kioku_items テーブルを作ります）。" +
-          "実行するまで、学習データはこの端末の中にだけ保存されます。消えることはありません。",
+          "同期の準備がまだ終わっていません。Firebase コンソールで Firestore Database を作成し、この画面の下に出ているルールを「ルール」タブに貼って公開してください。" +
+          "それまで、学習データはこの端末の中にだけ保存されます。消えることはありません。",
       });
       return;
     }
@@ -886,17 +938,43 @@ class App extends Component {
     return line ? msg + "\n（" + BUILD + " / " + line.slice(0, 120) + "）" : msg + "\n（" + BUILD + "）";
   }
 
-  // 同期がうまくいかないときに、どのCDNが何を返しているかを画面に出します。
+  // ログインの失敗を日本語にします。Firebase Auth は code で理由を返します。
+  authErrText(e) {
+    const code = String((e && e.code) || "");
+    const map = {
+      "auth/invalid-credential": "メールアドレスかパスワードが違います。",
+      "auth/wrong-password": "メールアドレスかパスワードが違います。",
+      "auth/user-not-found": "このメールアドレスは登録されていません。はじめての方は「新規登録」を選んでください。",
+      "auth/invalid-email": "メールアドレスの形式が正しくありません。",
+      "auth/email-already-in-use": "このメールアドレスは登録済みです。「ログイン」を選んでください。",
+      "auth/weak-password": "パスワードは6文字以上にしてください。",
+      "auth/too-many-requests": "試行回数が多すぎます。しばらく待ってからもう一度お試しください。",
+      "auth/network-request-failed": "通信できませんでした。回線を確かめてもう一度お試しください。",
+      "auth/operation-not-allowed":
+        "このログイン方法は保存先で有効になっていません。Firebase コンソールの Authentication → Sign-in method で有効にしてください。",
+      "auth/unauthorized-domain":
+        "このサイトのドメインがログインを許可されていません。Firebase コンソールの Authentication → 設定 → 承認済みドメインに追加してください。",
+      "auth/popup-blocked": "ログイン用のウィンドウが開けませんでした。ポップアップを許可してもう一度押してください。",
+      "auth/popup-closed-by-user": null,
+      "auth/cancelled-popup-request": null,
+      "auth/account-exists-with-different-credential":
+        "このメールアドレスは別の方法で登録されています。メールアドレスとパスワードでログインしてください。",
+    };
+    if (Object.prototype.hasOwnProperty.call(map, code)) return map[code];
+    return this.errText(e);
+  }
+
+  // 同期がうまくいかないときに、SDK の読み込みとクラウドの中身を画面に出します。
   async diagnose() {
     const c = this.cfg();
     const lines = ["診断結果  ビルド " + BUILD];
-    if (this._sbNote) lines.push(this._sbNote);
-    if (!c || !c.url || !c.key) {
+    if (!c) {
       lines.push("接続情報が未設定です");
       this.setState({ syncError: lines.join("\n") });
       return;
     }
-    lines.push("接続先 " + c.url + " / キー " + c.key.slice(0, 8) + "…（" + c.key.length + "文字）");
+    lines.push("接続先 " + c.projectId + " / キー " + c.apiKey.slice(0, 8) + "…（" + c.apiKey.length + "文字）");
+    if (this._fbNote) lines.push(this._fbNote);
     lines.push("");
     lines.push("この端末  " + (this._syncUserEmail || "未ログイン"));
     lines.push(
@@ -906,49 +984,35 @@ class App extends Component {
         "  未送信 " + (function (x) {
           return x.put.length + x.del.length;
         })(this.pending()) + " 件" +
-        "  即時反映 " + (this._rt ? "接続" : "なし")
+        "  即時反映 " + (this._fbListener ? "接続" : "なし")
     );
     this.setState({ syncBusy: true, syncError: lines.join("\n") + "\n診断中…" });
     // クラウドに今なにが入っているかを直接見ます。端末側との食い違いはここで分かります。
     if (this._syncUserEmail) {
       try {
-        const sb = await this.loadSb();
-        const { data: u } = await sb.auth.getUser();
-        const { data, error } = await sb
-          .from("kioku_items")
-          .select("kind, item_id, data, deleted_at")
-          .eq("user_id", u.user.id)
-          .is("deleted_at", null);
-        if (error) throw error;
-        const rows = data || [];
+        const kit = await this.loadFb();
+        const F = kit.F;
+        const snap = await F.getDocsFromServer(F.collection(kit.db, "users", kit.auth.currentUser.uid, "items"));
+        const rows = snap.docs.map((d) => d.data()).filter((r) => !r.deleted_at);
         const dk = rows.filter((r) => r.kind === "deck");
         lines.push("クラウド  デッキ " + dk.length + " / カード " + rows.filter((r) => r.kind === "card").length);
         lines.push("  [" + dk.map((r) => (r.data || {}).name).slice(0, 6).join(" / ") + "]");
       } catch (e) {
-        lines.push("クラウド  読めません：" + String((e && e.message) || e).slice(0, 120));
+        lines.push("クラウド  読めません：" + String((e && (e.code || e.message)) || e).slice(0, 120));
       }
       lines.push("");
       this.setState({ syncError: lines.join("\n") });
     }
-    for (let i = 0; i < SB_SOURCES.length; i++) {
-      const src = SB_SOURCES[i];
-      const where = new URL(src).hostname + (src.indexOf("+esm") >= 0 ? "(+esm)" : "");
+    for (let i = 0; i < FB_SOURCES.length; i++) {
+      const src = FB_SOURCES[i];
+      const where = new URL(src.app).hostname;
       try {
-        const m = await import(src);
-        const create = m.createClient || (m.default && m.default.createClient);
-        if (typeof create !== "function") {
-          lines.push(where + "：createClient なし [" + Object.keys(m).slice(0, 6).join(",") + "]");
-          continue;
-        }
-        const cl = create(c.url, c.key, { auth: { persistSession: false } });
+        const mods = await Promise.all([import(src.app), import(src.auth), import(src.store)]);
         lines.push(
           where +
-            "：client=" +
-            (cl ? typeof cl : "なし") +
-            " auth=" +
-            (cl && cl.auth ? typeof cl.auth : "なし") +
-            " signIn=" +
-            (cl && cl.auth ? typeof cl.auth.signInWithPassword : "-")
+            "：initializeApp=" + typeof mods[0].initializeApp +
+            " signIn=" + typeof mods[1].signInWithEmailAndPassword +
+            " firestore=" + typeof mods[2].getFirestore
         );
       } catch (e) {
         lines.push(where + "：失敗 " + String((e && e.message) || e).slice(0, 100));
@@ -958,59 +1022,118 @@ class App extends Component {
     this.setState({ syncBusy: false, syncError: lines.join("\n") });
   }
 
-  async loadSb() {
+  // Firebase SDK を読み込み、app / auth / db をまとめた「道具箱」を返します。
+  // 初期表示を軽くするため、同期を使うときに初めて読み込みます。
+  // 名前は _fbKit（短い _ 始まりの名前は Preact の内部プロパティとぶつかります）。
+  async loadFb() {
     const c = this.cfg();
-    if (!c || !c.url || !c.key) throw new Error("接続情報が未設定です");
-    // 使い回す前にも中身を確かめる。何かに書き換わっていたら作り直します。
-    if (this._sbClient) {
-      if (this._sbClient.auth && typeof this._sbClient.auth.signInWithPassword === "function") {
-        return this._sbClient;
+    if (!c) throw new Error("接続情報が未設定です");
+    const tag = c.projectId + "|" + c.apiKey;
+    // 使い回す前に中身を確かめます。何かに書き換わっていたら作り直します。
+    if (this._fbKit) {
+      if (this._fbKit.tag === tag && this._fbKit.auth && this._fbKit.db && this._fbKit.F) return this._fbKit;
+      if (this._fbKit.tag !== tag) {
+        this.unsubscribeRealtime();
+        if (this._fbAuthUnsub) this._fbAuthUnsub();
+        this._fbAuthUnsub = null;
+      } else {
+        this._fbNote = "保持していた接続が別のものに変わっていました。作り直します。";
       }
-      this._sbNote =
-        "保持していたクライアントが別のものに変わっていました：" +
-        Object.prototype.toString.call(this._sbClient) +
-        " [" +
-        Object.keys(this._sbClient || {}).slice(0, 8).join(",") +
-        "]";
-      this._sbClient = null;
+      this._fbKit = null;
     }
+    if (this._fbLoading) return this._fbLoading;
 
-    const notes = [];
-    for (let i = 0; i < SB_SOURCES.length; i++) {
-      const src = SB_SOURCES[i];
-      const where = new URL(src).hostname;
-      let m = null;
-      try {
-        m = await import(src);
-      } catch (e) {
-        notes.push(where + "：読み込めませんでした");
-        continue;
+    this._fbLoading = (async () => {
+      const notes = [];
+      for (let i = 0; i < FB_SOURCES.length; i++) {
+        const src = FB_SOURCES[i];
+        const where = new URL(src.app).hostname;
+        let A, Au, F;
+        try {
+          [A, Au, F] = await Promise.all([import(src.app), import(src.auth), import(src.store)]);
+        } catch (e) {
+          notes.push(where + "：読み込めませんでした");
+          continue;
+        }
+        if (typeof A.initializeApp !== "function" || typeof Au.initializeAuth !== "function" || typeof F.getFirestore !== "function") {
+          notes.push(where + "：SDKの形式が想定と違います");
+          continue;
+        }
+        try {
+          // 保存先ごとに別の名前で作ります。保存先を切り替えたときに古い設定を引きずらないためです。
+          const name = "kioku-" + c.projectId;
+          const app = A.getApps().find((a) => a.name === name) || A.initializeApp(c, name);
+          let auth;
+          try {
+            // セッションは localStorage に置きます（既定の IndexedDB だと、起動時に
+            // 「ログイン済みか」を同期的に判定できず、ログイン画面がちらつきます）。
+            auth = Au.initializeAuth(app, {
+              persistence: Au.browserLocalPersistence,
+              popupRedirectResolver: Au.browserPopupRedirectResolver,
+            });
+          } catch (e) {
+            auth = Au.getAuth(app);
+          }
+          let db;
+          try {
+            // 端末内キャッシュは使いません（既定のメモリキャッシュのまま）。
+            // 手元の正は localStorage（kioku.mvp.v1）で、置き場所を二つにすると食い違います。
+            db = F.initializeFirestore(app, { ignoreUndefinedProperties: true });
+          } catch (e) {
+            db = F.getFirestore(app);
+          }
+          // 手元での動作確認用。window.KIOKU_EMULATOR を立てたときだけエミュレータへ繋ぎます。
+          if (window.KIOKU_EMULATOR && !app.__kiokuEmu) {
+            app.__kiokuEmu = true;
+            Au.connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+            F.connectFirestoreEmulator(db, "127.0.0.1", 8080);
+          }
+          const kit = { tag, app, auth, db, A, Au, F };
+          this._fbKit = kit;
+          return kit;
+        } catch (e) {
+          notes.push(where + "：初期化に失敗（" + (e.message || e) + "）");
+        }
       }
-      const create = m.createClient || (m.default && m.default.createClient);
-      if (typeof create !== "function") {
-        notes.push(where + "：createClient が見つかりません");
-        continue;
-      }
-      let client = null;
-      try {
-        client = create(c.url, c.key, {
-          // flowType は Google ログイン用です。戻り先の URL に ?code= が付き、SDK が
-          // 自動でセッションに交換します（detectSessionInUrl は既定で有効）。
-          auth: { persistSession: true, storageKey: "kioku.sb.auth", flowType: "pkce" },
-        });
-      } catch (e) {
-        notes.push(where + "：初期化に失敗（" + (e.message || e) + "）");
-        continue;
-      }
-      // CDN 側のビルドが壊れていると auth を持たないクライアントが返ることがあります。
-      if (!client || !client.auth || typeof client.auth.signInWithPassword !== "function") {
-        notes.push(where + "：SDKの形式が想定と違います");
-        continue;
-      }
-      this._sbClient = client;
-      return client;
+      throw new Error("Firebase SDK を読み込めませんでした。" + notes.join(" / "));
+    })();
+    try {
+      return await this._fbLoading;
+    } finally {
+      this._fbLoading = null;
     }
-    throw new Error("Supabase SDK を読み込めませんでした。" + notes.join(" / "));
+  }
+
+  // Firebase のセッションが端末に残っているか。SDK を読み込む前に、同期的に判定します。
+  hasFbSession() {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf("firebase:authUser:") === 0) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // 保存済みのセッションを SDK が読み終えるまで待ちます。
+  async authReady(kit) {
+    if (typeof kit.auth.authStateReady === "function") {
+      await kit.auth.authStateReady();
+      return kit.auth.currentUser;
+    }
+    return new Promise((res) => {
+      const off = kit.Au.onAuthStateChanged(kit.auth, (u) => {
+        off();
+        res(u);
+      });
+    });
+  }
+
+  // いまのログイン中のユーザー ID。同期の読み書きは必ずこれを通します。
+  fbUid(kit) {
+    const u = kit.auth.currentUser;
+    if (!u) throw new Error("ログインしていません");
+    return u.uid;
   }
 
   async initSync() {
@@ -1020,46 +1143,35 @@ class App extends Component {
     }
     this._initializing = true;
     try {
-      const sb = await this.loadSb();
-      const { data } = await sb.auth.getSession();
-      const user = data && data.session ? data.session.user : null;
-      this.setSyncUser(user ? user.email : null);
+      const kit = await this.loadFb();
+      const user = await this.authReady(kit);
+      this.setSyncUser(user ? user.email || user.uid : null);
       this.setState({ booting: false });
       if (user) this.leaveLocalOnly();
-      if (this._oauthReturning) {
-        // ?code= を残すと、再読み込みのたびに使用済みのコードを交換しようとして失敗します。
-        this._oauthReturning = false;
-        this.clearOauthParams();
-        if (user) {
-          if (this.state.screen === "login") this.setState({ screen: "home" });
-          this.toast("ログインしました");
-        } else {
-          this.setState({ syncError: "Google でのログインを完了できませんでした。もう一度お試しください。" });
-        }
-      }
-      if (!this._authSub) {
-        this._authSub = sb.auth.onAuthStateChange((evt, session) => {
-          const u = session ? session.user.email : null;
+      if (!this._fbAuthUnsub) {
+        this._fbAuthUnsub = kit.Au.onAuthStateChanged(kit.auth, (u) => {
+          const who = u ? u.email || u.uid : null;
           // 比較も setSyncUser が入れた値で行います。state.syncUser を見ると、
           // 直前の setState がまだ反映されておらず二重に pull します。
-          if (u === this._syncUserEmail) return;
-          this.setSyncUser(u);
+          if (who === this._syncUserEmail) return;
+          this.setSyncUser(who);
           if (u) {
             this.leaveLocalOnly();
             this.pull(true);
-            if (session && session.user) this.subscribeRealtime(sb, session.user.id);
+            this.subscribeRealtime();
+          } else {
+            this.unsubscribeRealtime();
           }
         });
       }
       if (user) {
         await this.pull(true);
-        this.subscribeRealtime(sb, user.id);
+        this.subscribeRealtime();
       }
     } catch (e) {
       // 復元するセッションが無いなら、まだ何もしていない人にエラーを見せる必要はありません。
       // 実際に困るのはログインを押したときで、そこで同じエラーが出ます。
-      // Google ログインを取り消して戻ってきたときのメッセージは消さずに残します。
-      this.setState({ syncError: this._hadStoredSession ? this.errText(e) : this._oauthError || null, booting: false });
+      this.setState({ syncError: this._hadStoredSession ? this.errText(e) : null, booting: false });
     } finally {
       this._initializing = false;
     }
@@ -1084,6 +1196,24 @@ class App extends Component {
     return !!this._syncUserEmail && this.state.screen !== "study";
   }
 
+  // ログインが済んだあとの共通処理。メールでも Google でもここを通します。
+  async afterSignIn(user) {
+    this.leaveLocalOnly();
+    localStorage.removeItem("kioku.sync.moved");
+    this.setSyncUser(user.email || user.uid);
+    this.setState({
+      syncPw: "",
+      syncBusy: false,
+      syncError: null,
+      movedBackend: false,
+      rulesNeeded: false,
+      screen: this.state.screen === "login" ? "home" : this.state.screen,
+    });
+    this.toast("ログインしました");
+    await this.pull(true);
+    this.subscribeRealtime();
+  }
+
   async signIn(mode) {
     const email = (this.state.syncEmail || "").trim();
     const pw = this.state.syncPw || "";
@@ -1093,101 +1223,43 @@ class App extends Component {
     }
     this.setState({ syncBusy: true, syncError: null });
     try {
-      const sb = await this.loadSb();
-      const res =
+      const kit = await this.loadFb();
+      // Firebase は登録と同時にログインします（確認メールを待つ必要はありません）。
+      const cred =
         mode === "up"
-          ? await sb.auth.signUp({ email, password: pw })
-          : await sb.auth.signInWithPassword({ email, password: pw });
-      if (res.error) throw res.error;
-      const data = res.data || {};
-      if (!data.session) {
-        this.setState({
-          syncBusy: false,
-          syncPw: "",
-          syncError:
-            "登録は受け付けられましたが、まだログインできていません。" +
-            email +
-            " に届いた確認メールのリンクを開いたうえで「ログイン」を押してください。（確認メールを不要にするには Supabase の Authentication → Sign In / Providers → Email で Confirm email を OFF にします）",
-        });
-        return;
-      }
-      this.leaveLocalOnly();
-      this.setSyncUser(data.session.user.email);
-      this.setState({
-        syncPw: "",
-        syncBusy: false,
-        syncError: null,
-        screen: this.state.screen === "login" ? "home" : this.state.screen,
-      });
-      this.toast("ログインしました");
-      await this.pull(true);
-      this.subscribeRealtime(sb, data.session.user.id);
+          ? await kit.Au.createUserWithEmailAndPassword(kit.auth, email, pw)
+          : await kit.Au.signInWithEmailAndPassword(kit.auth, email, pw);
+      await this.afterSignIn(cred.user);
     } catch (e) {
-      this.setState({ syncBusy: false, syncError: this.errText(e) });
+      this.setState({ syncBusy: false, syncError: this.authErrText(e) });
     }
   }
 
-  // Google ログイン。Supabase の認可画面へページごと移動し、終わると redirectTo に戻ってきます。
-  // 戻ってきたあとの処理（?code= の交換）は initSync の getSession が SDK 経由で行います。
-  // 学習データは persist の時点で localStorage に書かれているので、ページを離れても失われません。
-  async signInWithGoogle() {
+  // Google ログイン。ポップアップで開きます（ページ移動のリダイレクト方式は、
+  // Firebase Hosting 以外に置いたサイトでは最近のブラウザで動かないため使いません）。
+  // ポップアップは「押した直後」に開かないとブラウザに止められるので、SDK は先に読み込んでおき、
+  // ここでは await を挟まずに signInWithPopup を呼びます。
+  signInWithGoogle() {
+    const kit = this._fbKit;
+    if (!kit) {
+      this.setState({ syncError: null });
+      this.toast("準備中です。もう一度押してください");
+      this.loadFb().catch((e) => this.setState({ syncError: this.errText(e) }));
+      return;
+    }
     this.setState({ syncBusy: true, syncError: null });
-    try {
-      const sb = await this.loadSb();
-      const res = await sb.auth.signInWithOAuth({
-        provider: "google",
-        options: { redirectTo: location.origin + location.pathname },
-      });
-      if (res.error) throw res.error;
-      // ここから先はページが移動します。移動できなかった場合に備えて通信中表示だけ戻します。
-      setTimeout(() => this.setState({ syncBusy: false }), 8000);
-    } catch (e) {
-      this.setState({ syncBusy: false, syncError: this.errText(e) });
-    }
-  }
-
-  // URL の ?code= / ?error= を読みます。エラーは Google 側で「キャンセル」したときなどに付きます。
-  oauthReturn() {
-    const q = new URLSearchParams(location.search);
-    const h = new URLSearchParams(location.hash.replace(/^#/, ""));
-    const desc = q.get("error_description") || h.get("error_description");
-    const err = q.get("error") || h.get("error");
-    return {
-      code: !!q.get("code"),
-      error: err ? "Google でのログインを完了できませんでした。" + (desc ? "（" + desc + "）" : "") : null,
-    };
-  }
-
-  clearOauthParams() {
-    try {
-      history.replaceState(null, "", location.pathname);
-    } catch (e) {}
-  }
-
-  // 保存先で Google ログインが有効になっているかを、Supabase の公開設定から確かめます。
-  // 有効にしていない保存先でボタンを押すと、Supabase の英語のエラーページに飛ばされるためです。
-  // 確かめられなかったとき（オフラインなど）は null のままにして、ボタンは出しておきます。
-  async checkGoogleAuth() {
-    const c = this.cfg();
-    if (!c || this._googleAuthFor === c.url) return;
-    this._googleAuthFor = c.url;
-    try {
-      const r = await fetch(c.url.replace(/\/+$/, "") + "/auth/v1/settings", { headers: { apikey: c.key } });
-      if (!r.ok) throw new Error(String(r.status));
-      const j = await r.json();
-      this.setState({ googleAuth: !!(j && j.external && j.external.google) });
-    } catch (e) {
-      this._googleAuthFor = null;
-      this.setState({ googleAuth: null });
-    }
+    const provider = new kit.Au.GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: "select_account" });
+    kit.Au.signInWithPopup(kit.auth, provider).then(
+      (cred) => this.afterSignIn(cred.user),
+      (e) => this.setState({ syncBusy: false, syncError: this.authErrText(e) })
+    );
   }
 
   // ログイン画面と同期画面の両方に出す「Google でログイン」。
   googleLoginButton(style) {
     const s = this.state;
-    if (s.googleAuth === false) return null;
-    // iPhone / iPad のホーム画面に追加したアプリは、外部サイトでのログインを別の画面で開き、
-    // そこで得たログイン状態をアプリ側に持ち帰れないことがあります。
+    // iPhone / iPad のホーム画面に追加したアプリでは、ログイン用のウィンドウを開けないことがあります。
     const iosStandalone = navigator.standalone === true;
     return html`<div style=${{ display: "grid", gap: 8 }}>
       <button
@@ -1212,8 +1284,8 @@ class App extends Component {
 
   async signOut() {
     try {
-      const sb = await this.loadSb();
-      await sb.auth.signOut();
+      const kit = await this.loadFb();
+      await kit.Au.signOut(kit.auth);
     } catch (e) {}
     // 手元の学習データは消しません。入口のログイン画面に戻すだけです。
     this._syncUserEmail = null;
@@ -1232,10 +1304,10 @@ class App extends Component {
     return { decks: s.decks, cards: s.cards, log: s.log, gradeTotals: s.gradeTotals, todayCount: s.todayCount };
   }
 
-  // ---- 同期（行ごと） ----
+  // ---- 同期（1件1ドキュメント） ----
   //
-  // カード・デッキは1件1行（kioku_items）。触った行だけを送り、前回以降に変わった行だけを取ります。
-  // 別々のカードを触っているかぎり、そもそも衝突しません。
+  // カード・デッキは1件1ドキュメント（users/{uid}/items/{kind:id}）。触ったものだけを送り、
+  // 前回以降に変わったものだけを取ります。別々のカードを触っているかぎり、そもそも衝突しません。
 
   // この端末の名札。学習枚数の集計で「誰がぶんか」を持つのに使います。
   deviceId() {
@@ -1247,9 +1319,12 @@ class App extends Component {
     return d;
   }
 
-  // 前回どこまで取り込んだか（サーバの updated_at）。ここから先だけを取りに行きます。
+  // 前回どこまで取り込んだか。「サーバが打った updated_at｜ドキュメントID」の形です（posOf()）。
+  // 時刻だけだと、まとめ書き（writeBatch）で同じ時刻になった行の途中で止まったとき、
+  // 残りを「もう取った」ことにして取りこぼします。ID まで持てば、同じ時刻の続きから取れます。
   cursor() {
-    return localStorage.getItem("kioku.sync.cursor") || "1970-01-01T00:00:00Z";
+    const c = localStorage.getItem("kioku.sync.cursor") || "";
+    return c.indexOf("|") > 0 ? c : posOf(null, "");
   }
 
   // 送信済みの内容を覚えておく控え。中身そのものではなく短いハッシュだけを持ちます
@@ -1310,7 +1385,7 @@ class App extends Component {
   }
 
   // まだ送っていない差分。控えと突き合わせて、増えた・変わった・消えたを出します。
-  // 消えたものは行を消さず deleted_at を立てます。**行を消すと「削除した」のか
+  // 消えたものはドキュメントを消さず deleted_at を立てます。**消すと「削除した」のか
   // 「まだ届いていない」のかが二度と分からなくなります。**
   pending() {
     const now = this.localRows();
@@ -1383,6 +1458,7 @@ class App extends Component {
   }
 
   // 受け取った行を手元に反映します。realtime からも同じ入口を通します。
+  // 行は fbRow() の形（kind / item_id / data / deleted_at / pos / at）。
   // advance は「ここまで受け取った」の印（cursor）を進めてよいか。
   // **realtime では進めません。** 届いた行より古い、まだ取っていない行があると、
   // 印だけ先に進んで、その行を永久に取りこぼします。realtime は表示を早めるだけにして、
@@ -1402,6 +1478,9 @@ class App extends Component {
     });
     const sh = this.shadow();
     const counts = this.counts();
+    // この端末のぶんは、受け取る前の値で固定しておきます（下の recount の説明）。
+    const mineNow = this.myCounts();
+    const me = this.deviceId();
     const pend = this.pending();
     const dirty = {};
     pend.put.forEach((x) => {
@@ -1411,10 +1490,14 @@ class App extends Component {
       dirty[x.key] = 1;
     });
     let cursor = this.cursor();
+    let at = null;
     let countsChanged = false;
 
     rows.forEach((r) => {
-      if (r.updated_at > cursor) cursor = r.updated_at;
+      if (r.pos > cursor) {
+        cursor = r.pos;
+        at = r.at;
+      }
       const key = r.kind + ":" + r.item_id;
       if (r.kind === "log" || r.kind === "grade") {
         counts[key] = r.deleted_at ? {} : r.data || {};
@@ -1424,7 +1507,11 @@ class App extends Component {
       if (r.kind !== "deck" && r.kind !== "card") return;
       // こちらで触ったまま送れていない項目は、相手の内容で潰しません。
       // カードは学習の進み具合だけ進んでいる方を採り、文言はこちらを残します。
-      if (dirty[key]) {
+      // ただし**この端末からまだ一度も送っていない項目（控えに無い）は相手を優先します。**
+      // ログインし直した直後や保存先を移した直後は、控えが空なので手元の全項目が「未送信」に
+      // 見えます。そこで手元を優先すると、他の端末で消したものを送り返して生き返らせたり、
+      // 他の端末で直した文言を古い文言で上書きしたりします。
+      if (dirty[key] && sh[key] !== undefined) {
         if (r.kind === "card" && !r.deleted_at && cIdx[r.item_id] !== undefined) {
           const mine = cards[cIdx[r.item_id]];
           const theirs = Object.assign({ id: r.item_id }, r.data);
@@ -1438,7 +1525,7 @@ class App extends Component {
         sh[key] = "-"; // 墓標。もう手元に無いが、削除済みだと分かる印
         return;
       }
-      const item = Object.assign({ id: r.item_id }, r.data);
+      let item = Object.assign({ id: r.item_id }, r.data);
       if (r.kind === "deck") {
         if (dIdx[r.item_id] === undefined) {
           dIdx[r.item_id] = decks.length;
@@ -1448,7 +1535,12 @@ class App extends Component {
         if (cIdx[r.item_id] === undefined) {
           cIdx[r.item_id] = cards.length;
           cards.push(item);
-        } else cards[cIdx[r.item_id]] = item;
+        } else {
+          // 控えに無いカード（上の説明）でも、学習の進み具合は進んでいる方を採ります。
+          // 結果が相手と違えば、次の送信で相手へ戻ります。
+          if (dirty[key]) item = pickCard(null, cards[cIdx[r.item_id]], item);
+          cards[cIdx[r.item_id]] = item;
+        }
       }
       sh[key] = hashOf(r.data);
     });
@@ -1458,7 +1550,13 @@ class App extends Component {
     const next = { decks: nextDecks, cards: nextCards };
     if (countsChanged) {
       this.setCounts(counts);
-      Object.assign(next, this.recount(counts));
+      // 合計を作るとき、この端末のぶんは受け取った行ではなく手元の値（mineNow）を使います。
+      // 受け取った行は「最後に送った値」なので、まだ送っていない直前の学習が入っていません。
+      // そのまま足すと、他の端末の行が届いた瞬間に、今日学習した枚数が合計から消えます。
+      const view = Object.assign({}, counts);
+      view["log:" + me] = mineNow.log;
+      view["grade:" + me] = mineNow.grade;
+      Object.assign(next, this.recount(view));
     }
     // 取り込みで消えたカードが出題キューに残らないようにします。
     const alive = {};
@@ -1469,39 +1567,54 @@ class App extends Component {
     this.setShadow(sh);
     if (advance) {
       localStorage.setItem("kioku.sync.cursor", cursor);
-      localStorage.setItem("kioku.sync.at", cursor);
+      if (at) localStorage.setItem("kioku.sync.at", at);
     }
-    this.setState(Object.assign({}, next, { queue }, advance ? { syncAt: cursor } : {}));
+    this.setState(Object.assign({}, next, { queue }, advance && at ? { syncAt: at } : {}));
     this.persistLocal(next);
     return true;
   }
 
-  // 前回以降に変わった行だけを取りに行きます。
+  // 自分のドキュメントの置き場所（users/{uid}/items）。
+  itemsCol(kit) {
+    return kit.F.collection(kit.db, "users", this.fbUid(kit), "items");
+  }
+
+  itemRef(kit, kind, itemId) {
+    return kit.F.doc(this.itemsCol(kit), docId(kind, itemId));
+  }
+
+  // 前回以降に変わったドキュメントだけを取りに行きます。
+  // **getDocsFromServer を使います。** 端末内のキャッシュから返されると、古い内容のまま
+  // 「取り込めた」ことになります（Service Worker のキャッシュで実際に起きたのと同じ形です）。
   async pull(silent) {
     if (!this._syncUserEmail || this._pulling) return;
     this._pulling = true;
     this.setState({ syncBusy: true, syncError: null });
     try {
-      const sb = await this.loadSb();
-      const { data: u } = await sb.auth.getUser();
-      await this.migrateLegacy(sb, u.user.id);
+      const kit = await this.loadFb();
+      const F = kit.F;
+      await this.seedCounts(kit);
       let from = this.cursor();
       let got = 0;
       // 1回で取り切れないほど溜まっていることがあるので、続きがある限り繰り返します。
+      // 並びは updated_at → ドキュメントID。startAfter に両方を渡して、ちょうど続きから取ります。
       for (let round = 0; round < 40; round++) {
-        const { data, error } = await sb
-          .from("kioku_items")
-          .select("kind, item_id, data, deleted_at, updated_at")
-          .eq("user_id", u.user.id)
-          .gt("updated_at", from)
-          .order("updated_at", { ascending: true })
-          .limit(1000);
-        if (error) throw error;
-        if (!data || !data.length) break;
-        this.applyRows(data, true);
-        got += data.length;
-        const last = data[data.length - 1].updated_at;
-        if (last === from || data.length < 1000) break;
+        const at = splitPos(F, from);
+        const q = F.query(
+          this.itemsCol(kit),
+          F.orderBy("updated_at"),
+          F.orderBy(F.documentId()),
+          // ID が空（まだ何も取っていない）のときは時刻だけで指定します。空の ID は Firestore が受け付けません。
+          at.id ? F.startAfter(at.ts, at.id) : F.startAfter(at.ts),
+          F.limit(1000)
+        );
+        const snap = await F.getDocsFromServer(q);
+        const rows = snap.docs.map((d) => fbRow(d.id, d.data())).filter(Boolean);
+        if (!rows.length) break;
+        this.applyRows(rows, true);
+        got += rows.length;
+        const last = rows[rows.length - 1].pos;
+        if (last === from || rows.length < 1000) break;
         from = last;
       }
       this.setState({ syncBusy: false });
@@ -1515,7 +1628,7 @@ class App extends Component {
     }
   }
 
-  // 触った行だけを送ります。行ごとなので、他の端末の別の行とはぶつかりません。
+  // 触ったものだけを送ります。1件1ドキュメントなので、他の端末の別の項目とはぶつかりません。
   async push(force) {
     if (!this._syncUserEmail || this._pushing) return;
     clearTimeout(this._pushT);
@@ -1525,8 +1638,7 @@ class App extends Component {
       const mine = this.myCounts();
       const counts = this.counts();
       const me = this.deviceId();
-      // 比較は canon で。素の JSON.stringify だと、サーバから戻ってきた行はキーの順が
-      // 並べ替わっているため、中身が同じでも毎回「変わった」ことになります。
+      // 比較は canon で。素の JSON.stringify だと、キーの順が違うだけで「変わった」ことになります。
       const logChanged = canon(counts["log:" + me] || {}) !== canon(mine.log);
       const gradeChanged = canon(counts["grade:" + me] || {}) !== canon(mine.grade);
       if (!force && !pend.put.length && !pend.del.length && !logChanged && !gradeChanged) {
@@ -1535,31 +1647,35 @@ class App extends Component {
         return;
       }
       this.setState({ syncBusy: true, syncError: null });
-      const sb = await this.loadSb();
-      const { data: u } = await sb.auth.getUser();
-      const uid2 = u.user.id;
-      const rows = [];
+      const kit = await this.loadFb();
+      const F = kit.F;
+      const writes = [];
       pend.put.forEach((x) => {
         const i = x.key.indexOf(":");
-        rows.push({ user_id: uid2, kind: x.key.slice(0, i), item_id: x.key.slice(i + 1), data: x.data, deleted_at: null });
+        writes.push([x.key.slice(0, i), x.key.slice(i + 1), x.data, false]);
       });
       pend.del.forEach((x) => {
         const i = x.key.indexOf(":");
-        rows.push({
-          user_id: uid2,
-          kind: x.key.slice(0, i),
-          item_id: x.key.slice(i + 1),
-          data: null,
-          deleted_at: new Date().toISOString(),
-        });
+        writes.push([x.key.slice(0, i), x.key.slice(i + 1), null, true]);
       });
-      if (logChanged) rows.push({ user_id: uid2, kind: "log", item_id: me, data: mine.log, deleted_at: null });
-      if (gradeChanged) rows.push({ user_id: uid2, kind: "grade", item_id: me, data: mine.grade, deleted_at: null });
+      if (logChanged) writes.push(["log", me, mine.log, false]);
+      if (gradeChanged) writes.push(["grade", me, mine.grade, false]);
 
-      // updated_at は送りません。サーバのトリガが打ちます（端末の時計に依存しないため）。
-      for (let i = 0; i < rows.length; i += 400) {
-        const { error } = await sb.from("kioku_items").upsert(rows.slice(i, i + 400), { onConflict: "user_id,kind,item_id" });
-        if (error) throw error;
+      // updated_at は端末の時計ではなく serverTimestamp() でサーバに打たせます
+      // （ルールでも request.time と一致しない書き込みは弾いています）。
+      // 1回のまとめ書きは500件までなので、400件ずつに分けます。
+      for (let i = 0; i < writes.length; i += 400) {
+        const batch = F.writeBatch(kit.db);
+        writes.slice(i, i + 400).forEach((w) => {
+          batch.set(this.itemRef(kit, w[0], w[1]), {
+            kind: w[0],
+            item_id: w[1],
+            data: w[2],
+            deleted_at: w[3] ? F.serverTimestamp() : null,
+            updated_at: F.serverTimestamp(),
+          });
+        });
+        await batch.commit();
       }
 
       const sh = this.shadow();
@@ -1586,88 +1702,94 @@ class App extends Component {
     }
   }
 
-  // 1行 JSON だった頃の kioku_state を、行に移します。
-  // **消さずに残します。** 移行がうまくいかなかったときの逃げ道になるのと、
-  // まだ更新していない端末が書き込んだ分をここから拾えるためです。
-  async migrateLegacy(sb, userId) {
-    try {
-      const { data, error } = await sb
-        .from("kioku_state")
-        .select("data, updated_at")
-        .eq("user_id", userId)
-        .maybeSingle();
-      if (error || !data || !data.data) return;
-      const done = localStorage.getItem("kioku.sync.legacy") || "";
-      if (done >= data.updated_at) return;
-      const d = stripSample(data.data).data;
-      const rows = [];
-      (d.decks || []).forEach((x) => {
-        rows.push({ user_id: userId, kind: "deck", item_id: x.id, data: deckRow(x), deleted_at: null });
-      });
-      alignDues(d.cards).forEach((c) => {
-        rows.push({ user_id: userId, kind: "card", item_id: c.id, data: cardRow(c), deleted_at: null });
-      });
-      // 学習枚数は legacy という1行にまとめます。端末ごとに持たせると、
-      // どの端末も同じ履歴を「自分のぶん」と主張して二重に数えます。
-      rows.push({ user_id: userId, kind: "log", item_id: "legacy", data: d.log || {}, deleted_at: null });
-      rows.push({
-        user_id: userId,
-        kind: "grade",
-        item_id: "legacy",
-        data: d.gradeTotals || { again: 0, hard: 0, good: 0, easy: 0 },
-        deleted_at: null,
-      });
-      // すでに行がある項目は上書きしません（消したものが生き返らないように）。
-      const { data: have, error: e2 } = await sb.from("kioku_items").select("kind, item_id").eq("user_id", userId);
-      if (e2) throw e2;
-      const known = {};
-      (have || []).forEach((r) => {
-        known[r.kind + ":" + r.item_id] = 1;
-      });
-      const fresh = rows.filter((r) => !known[r.kind + ":" + r.item_id]);
-      for (let i = 0; i < fresh.length; i += 400) {
-        const { error: e3 } = await sb.from("kioku_items").upsert(fresh.slice(i, i + 400), { onConflict: "user_id,kind,item_id" });
-        if (e3) throw e3;
-      }
-      localStorage.setItem("kioku.sync.legacy", data.updated_at);
-    } catch (e) {
-      // 移行できなくても、行の同期そのものは動きます。次回また試します。
+  // Supabase から移ってきた端末が持っている学習枚数・評価の行を、Firebase へ持ち込みます。
+  // カードとデッキは控えが空なので放っておいても全部送られますが、学習枚数は
+  // 「この端末のぶん」しか送らないため、他の端末と legacy のぶんが失われます。
+  // 自分の端末のぶんも、ここで必ず送ります。push() は「控えの値と変わったときだけ」送るので、
+  // Supabase 時代の控えがそのまま残っていると、変わっていないことになって一度も送られません。
+  // **他の端末のぶんは、すでにある行を上書きしません。** 持ち主の端末が書いた新しい値を
+  // 古い値で潰さないためです。ユーザーごとに1回だけ行います（kioku.sync.seeded）。
+  async seedCounts(kit) {
+    const who = this.fbUid(kit);
+    if (localStorage.getItem("kioku.sync.seeded") === who) return;
+    const counts = this.counts();
+    const me = this.deviceId();
+    const mine = this.myCounts();
+    const F = kit.F;
+    const batch = F.writeBatch(kit.db);
+    const stamp = (data) => ({ data, deleted_at: null, updated_at: F.serverTimestamp() });
+    batch.set(this.itemRef(kit, "log", me), Object.assign({ kind: "log", item_id: me }, stamp(mine.log)));
+    batch.set(this.itemRef(kit, "grade", me), Object.assign({ kind: "grade", item_id: me }, stamp(mine.grade)));
+    counts["log:" + me] = mine.log;
+    counts["grade:" + me] = mine.grade;
+    const keys = Object.keys(counts).filter((k) => k !== "log:" + me && k !== "grade:" + me);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const j = k.indexOf(":");
+      const kind = k.slice(0, j);
+      const itemId = k.slice(j + 1);
+      if (kind !== "log" && kind !== "grade") continue;
+      const ref = this.itemRef(kit, kind, itemId);
+      const have = await F.getDocFromServer(ref);
+      if (have.exists()) continue;
+      batch.set(ref, Object.assign({ kind, item_id: itemId }, stamp(counts[k] || {})));
     }
+    await batch.commit();
+    this.setCounts(counts);
+    localStorage.setItem("kioku.sync.seeded", who);
   }
 
-  // 変更を待たずに受け取ります。届いた行はそのまま applyRows に流します。
-  async subscribeRealtime(sb, userId) {
-    if (this._rt || !sb.channel) return;
+  // 変更を待たずに受け取ります。届いたドキュメントはそのまま applyRows に流します。
+  // 自分が書いた直後の「まだサーバに届いていない」版（hasPendingWrites）は飛ばします。
+  // updated_at がまだ入っていないので、順序の判断に使えません。
+  async subscribeRealtime() {
+    if (this._fbListener || !this._syncUserEmail) return;
     try {
-      this._rt = sb
-        .channel("kioku-items")
-        .on(
-          "postgres_changes",
-          { event: "*", schema: "public", table: "kioku_items", filter: "user_id=eq." + userId },
-          (payload) => {
-            const r = payload && payload.new;
-            if (r && r.kind) this.applyRows([r], false);
-          }
-        )
-        .subscribe();
+      const kit = await this.loadFb();
+      const F = kit.F;
+      const q = F.query(this.itemsCol(kit), F.where("updated_at", ">", splitPos(F, this.cursor()).ts));
+      this._fbListener = F.onSnapshot(
+        q,
+        (snap) => {
+          const rows = [];
+          snap.docChanges().forEach((ch) => {
+            if (ch.type === "removed" || ch.doc.metadata.hasPendingWrites) return;
+            const r = fbRow(ch.doc.id, ch.doc.data());
+            if (r) rows.push(r);
+          });
+          // 学習中はカードを差し替えません（canSyncNow の説明）。次の pull で追いつきます。
+          if (rows.length && this.canSyncNow()) this.applyRows(rows, false);
+        },
+        () => {
+          this._fbListener = null; // 使えなくても60秒ごとの見直しで追いつきます
+        }
+      );
     } catch (e) {
-      this._rt = null; // 使えなくても60秒ごとの見直しで追いつきます
+      this._fbListener = null;
     }
   }
 
   unsubscribeRealtime() {
     try {
-      if (this._rt && this._sbClient && this._sbClient.removeChannel) this._sbClient.removeChannel(this._rt);
+      if (this._fbListener) this._fbListener();
     } catch (e) {}
-    this._rt = null;
+    this._fbListener = null;
   }
 
   // 同期の控えを捨てます。学習データ（kioku.mvp.v1）には触りません。
   // 次に繋いだときは、控えが無いので全部を送り直し、全部を取り直します。
+  // **学習枚数の内訳（kioku.sync.counts）は残します。** 手元の合計は全端末の合計なので、
+  // 内訳を捨てると「この端末のぶん」が合計そのものになり、再ログインで他の端末のぶんを
+  // 自分のぶんとして送って、二重に数えます。
   forgetSyncState() {
-    ["kioku.sync.at", "kioku.sync.cursor", "kioku.sync.shadow", "kioku.sync.counts", "kioku.sync.legacy", "kioku.sync.base"].forEach(
-      (k) => localStorage.removeItem(k)
-    );
+    [
+      "kioku.sync.at",
+      "kioku.sync.cursor",
+      "kioku.sync.shadow",
+      "kioku.sync.legacy",
+      "kioku.sync.base",
+      "kioku.sync.seeded",
+    ].forEach((k) => localStorage.removeItem(k));
   }
 
   queuePush() {
@@ -1686,62 +1808,35 @@ class App extends Component {
     this.push();
   }
 
+  // 「別の保存先を使う」。Firebase コンソールの「SDK の設定と構成」に出る firebaseConfig を
+  // そのまま貼ってもらい、必要な値だけを抜き出します。
   saveCfg() {
-    const url = (this.state.sbUrl || "").trim();
-    const key = (this.state.sbKey || "").trim();
-    let origin = "";
-    try {
-      origin = new URL(url).origin;
-    } catch (e) {}
-    if (!origin) {
-      this.toast("URLは https:// から始まる Project URL を入力してください");
+    const parsed = parseFbConfig(this.state.fbCfgText || "");
+    if (!parsed) {
+      this.toast("firebaseConfig の apiKey と projectId が見つかりません");
       return;
     }
-    if (/supabase\.com$/.test(new URL(origin).hostname)) {
-      this.setState({
-        syncError:
-          "これはダッシュボードのURLです。Project Settings → Data API にある Project URL（https://〇〇〇.supabase.co）を貼ってください。",
-      });
-      return;
-    }
-    if (key.length < 20) {
-      this.toast("キーが短すぎます。Publishable key 全体を貼り付けてください");
-      return;
-    }
-    if (/^sb_secret_/.test(key)) {
-      this.toast("Secret key は使えません。Publishable key を貼ってください");
-      return;
-    }
-    localStorage.setItem("kioku.sync.cfg", JSON.stringify({ url: origin, key }));
-    this._sbClient = null;
-    this.setState({ sbUrl: origin, syncError: null });
+    localStorage.setItem("kioku.sync.cfg", JSON.stringify(parsed));
+    this.unsubscribeRealtime();
+    this._syncUserEmail = null;
+    this.forgetSyncState();
+    this.setState({ syncUser: null, syncAt: null, syncError: null, fbCfgText: "" });
     this.toast("接続情報を保存しました");
     this.initSync();
-    this.checkGoogleAuth();
   }
 
-  // 端末で上書きした保存先を捨てます。DEFAULT_SB があればそちらに戻ります。
+  // 端末で上書きした保存先を捨てます。DEFAULT_FB があればそちらに戻ります。
   clearCfg() {
     localStorage.removeItem("kioku.sync.cfg");
-    this._sbClient = null;
     this._syncUserEmail = null;
     this._pushPending = false;
     clearTimeout(this._pushT);
     this.unsubscribeRealtime();
     this.forgetSyncState();
-    const back = DEFAULT_SB.url && DEFAULT_SB.key;
-    this.setState({
-      syncUser: null,
-      syncAt: null,
-      sbUrl: back ? DEFAULT_SB.url : "",
-      sbKey: back ? DEFAULT_SB.key : "",
-      syncError: null,
-    });
+    const back = !!(DEFAULT_FB.apiKey && DEFAULT_FB.projectId);
+    this.setState({ syncUser: null, syncAt: null, syncError: null });
     this.toast(back ? "既定の保存先に戻しました" : "接続を解除しました");
-    if (back) {
-      this.initSync();
-      this.checkGoogleAuth();
-    }
+    if (back) this.initSync();
   }
 
   // 端末に古い版が残ったときの逃げ道。キャッシュとService Workerを捨てて読み直します。
@@ -2124,7 +2219,9 @@ class App extends Component {
           }}
         >
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
-            いまはこの端末の中だけに保存されています。ログインすると他の端末と同じ状態になります。
+            ${s.movedBackend
+              ? "同期の保存先を新しくしました。もう一度ログインしてください（メールアドレスで使っていた方は「新規登録」から登録し直してください）。学習データはこの端末に残っています。"
+              : "いまはこの端末の中だけに保存されています。ログインすると他の端末と同じ状態になります。"}
           </div>
           <button
             class="soft"
@@ -3825,7 +3922,7 @@ class App extends Component {
   }
 
   // 入口。デッキやカードを見る前に、ここでログインします。
-  // 保存先（URLとキー）は DEFAULT_SB に持たせているので、ここで聞くのはメールとパスワードだけです。
+  // 保存先（firebaseConfig）は DEFAULT_FB に持たせているので、ここで聞くのはメールとパスワードだけです。
   renderLogin(box, field, primary, secondary) {
     const s = this.state;
     const up = s.authMode === "up";
@@ -4057,17 +4154,17 @@ class App extends Component {
           }}
           onClick=${() => this.setState({ syncAdvanced: !s.syncAdvanced })}
         >
-          ${(s.syncAdvanced ? "▾ " : "▸ ") + "別の保存先を使う（自分の Supabase プロジェクト）"}
+          ${(s.syncAdvanced ? "▾ " : "▸ ") + "別の保存先を使う（自分の Firebase プロジェクト）"}
         </button>`}
 
-        ${(advOpen || s.sqlNeeded) &&
+        ${(advOpen || s.rulesNeeded) &&
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
           <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>保存先を用意する</div>
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.8, marginBottom: 14 }}>
-            <a href="https://supabase.com" target="_blank" rel="noreferrer">Supabase</a>
-            で無料プロジェクトを作り、SQL Editor に下のSQLを貼って実行します。次に Project Settings → API から
-            <strong>Project URL</strong> と <strong>Publishable key</strong>（sb_publishable_… / 旧 anon key）をコピーしてください。Secret
-            key は使いません。
+            <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer">Firebase コンソール</a>
+            で無料プロジェクトを作り、Firestore Database を作成して、「ルール」タブに下のルールを貼って公開します。
+            Authentication では「メール / パスワード」と「Google」を有効にしてください。
+            最後に、プロジェクトの設定 → マイアプリでウェブアプリを追加し、表示される <strong>firebaseConfig</strong> をコピーします。
           </div>
           <div
             style=${{
@@ -4082,7 +4179,7 @@ class App extends Component {
               overflowX: "auto",
             }}
           >
-            ${SQL_SETUP}
+            ${RULES_SETUP}
           </div>
           <button
             class="soft"
@@ -4097,10 +4194,10 @@ class App extends Component {
             }}
             onClick=${() => {
               if (navigator.clipboard)
-                navigator.clipboard.writeText(SQL_SETUP).then(() => this.toast("SQLをコピーしました"), () => {});
+                navigator.clipboard.writeText(RULES_SETUP).then(() => this.toast("ルールをコピーしました"), () => {});
             }}
           >
-            SQLをコピー
+            ルールをコピー
           </button>
         </div>`}
 
@@ -4108,23 +4205,25 @@ class App extends Component {
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
           <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>接続情報</div>
           <div style=${{ display: "grid", gap: 10 }}>
-            <input
-              placeholder="https://xxxxx.supabase.co"
-              value=${s.sbUrl}
-              onInput=${(e) => this.setState({ sbUrl: e.target.value })}
-              style=${Object.assign({}, field, { fontSize: 13 })}
-            />
-            <input
-              placeholder="publishable key（sb_publishable_... / 旧 anon key）"
-              value=${s.sbKey}
-              onInput=${(e) => this.setState({ sbKey: e.target.value })}
-              style=${Object.assign({}, field, { fontSize: 13 })}
-            />
+            ${own &&
+            html`<div style=${{ fontSize: 12, color: C.faint }}>いまの保存先：${cfg.projectId}</div>`}
+            <textarea
+              rows="6"
+              placeholder=${"firebaseConfig をそのまま貼り付けてください\n{\n  apiKey: \"...\",\n  authDomain: \"...\",\n  projectId: \"...\",\n  appId: \"...\"\n}"}
+              value=${s.fbCfgText}
+              onInput=${(e) => this.setState({ fbCfgText: e.target.value })}
+              style=${Object.assign({}, field, {
+                fontSize: 12,
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                lineHeight: 1.6,
+                resize: "vertical",
+              })}
+            ></textarea>
             <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <button style=${primary} onClick=${() => this.saveCfg()}>保存して接続</button>
               ${own &&
               html`<button class="danger" style=${Object.assign({}, secondary, { background: "none", color: C.faint })} onClick=${() => this.clearCfg()}>
-                ${DEFAULT_SB.url && DEFAULT_SB.key ? "既定の保存先に戻す" : "接続を解除"}
+                ${DEFAULT_FB.apiKey && DEFAULT_FB.projectId ? "既定の保存先に戻す" : "接続を解除"}
               </button>`}
             </div>
           </div>

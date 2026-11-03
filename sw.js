@@ -1,4 +1,4 @@
-const CACHE = 'kioku-v33';
+const CACHE = 'kioku-v34';
 const ASSETS = [
   './',
   './index.html',
@@ -24,8 +24,10 @@ self.addEventListener('activate', (e) => {
 });
 
 // キャッシュしてよい外部オリジン。**内容が変わらないものだけ**を並べること。
-// ここに Supabase の API を入れてはいけません。
+// ここに Firebase の API（*.googleapis.com）を入れてはいけません。
+// www.gstatic.com は版を固定した Firebase SDK の配信元なので、内容は変わりません。
 const CDN = [
+  'https://www.gstatic.com',
   'https://esm.sh',
   'https://cdn.jsdelivr.net',
   'https://fonts.googleapis.com',
@@ -37,7 +39,7 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
 
-  // 同一オリジンと上の CDN 以外（＝ Supabase の API）は、何もせずネットワークに任せます。
+  // 同一オリジンと上の CDN 以外（＝ Firebase の API）は、何もせずネットワークに任せます。
   // **この判定を外さないでください。** クラウドからの取り込みは GET なので、
   // ここで拾うとキャッシュに載った古い応答が返り続けます。問い合わせURLは毎回同じなので、
   // 一度載ると永久に古いままです。実際にこれで「PCで作ったデッキがスマホに出てこない」
