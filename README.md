@@ -65,6 +65,11 @@ main への push で GitHub Actions が Firebase Hosting に公開します。�
 自分の Firebase プロジェクトを使う場合は、アプリの「同期」画面 →「別の保存先を使う」の手順に従い、
 Firestore のルールを貼ってから firebaseConfig を貼り付けます。設計の詳細は [CLAUDE.md](./CLAUDE.md) の「同期」の節にあります。
 
+## API でカードを追加
+
+ログイン後、「同期」画面の「API でカードを追加」でトークンを発行し、「AI に渡す説明をコピー」を AI に貼ると、
+AI（Claude Code など）が Firestore の REST API 経由でカードを追加できます。仕組みは [CLAUDE.md](./CLAUDE.md) の同名の節にあります。
+
 ## ライセンス
 
 MIT

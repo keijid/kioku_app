@@ -437,6 +437,30 @@ Authentication → Sign-in method で「Google」を有効にする（「メー�
 ログアウトと接続解除では `forgetSyncState()` で控え（at / cursor / shadow / seeded など）を捨てます。
 **学習データ（`kioku.mvp.v1`）と内訳（`kioku.sync.counts`）には触りません。**
 
+## API でカードを追加
+
+AI（Claude Code など、プログラムを実行できるもの）からカードを送るための口です。
+**サーバーは持ちません**（Cloud Functions は Blaze プランが要るため）。Firestore の REST API に直接書かせます。
+
+| 置き場所 | 中身 | ルール |
+| --- | --- | --- |
+| `users/{uid}/apiTokens/{トークン}` | `{ created_at }` | 本人だけ読み書き |
+| `users/{uid}/inbox/{自動ID}` | `{ token, deck?, cards?[], front?, back?, hint? }` | **ログイン不要で作成可**。ただし `token` が本人の `apiTokens` にあるときだけ。キーは上の6つだけ、`cards` は200件まで。読み・削除は本人だけ |
+
+- 同期画面の「API でカードを追加」でトークンを発行します（`issueApiToken()`。24バイトの乱数を base64url にしたもの、1本だけ）。
+  「AI に渡す説明をコピー」（`apiGuide()`）が送り先の URL・トークン・本文の例・curl をまとめて出します
+- アプリは `subscribeInbox()`（開いている間）と `pull()`（開いたとき・60秒ごと）で inbox を見て、
+  `importInbox()` がカードにしてから inbox のドキュメントを**消します**。inbox は同期の項目（items）ではないので消してよく、
+  取り込んだカードは `persist` で普通に同期されます
+- 外から来た中身なので、`importInbox()` は文字列以外を捨て、`API_TEXT_MAX`（2000字）で切り、表か裏が空のものを飛ばします。
+  重複は一括取り込みと同じく「同じデッキに同じ表があるか」で判定します
+- デッキは名前で探し、無ければ作ります。名前を省くと `API_DECK`（「API で追加」）。新しく作るデッキの ID は名前のハッシュ、
+  カードの ID は `capi<inboxのID>_<番号>` なので、**2台が同時に取り込んでも同じデッキ・同じカードになります**（二重にならない）
+- 学習中（`screen === "study"`）は取り込みません（出題キューを崩さないため）
+- `RULES_SETUP` を変えたので、**Firestore のルールを貼り直すまでトークンの発行は `permission-denied` になります**
+  （`syncFail()` がルールを出して案内します）。取り込み側の失敗は黙って無視し、カードの同期は止めません
+- claude.ai の普通のチャットは POST できないので、この API は呼べません。そこから使うには MCP サーバー（＝サーバーが要る）が必要です
+
 ## 入口（ログイン画面）
 
 デッキやカードを見る前に `renderLogin()` を挟みます。判定は `render()` の先頭にまとめてあります。

@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v39";
+const BUILD = "v40";
 
 const C = {
   bg: "#F3EFE6",
@@ -82,6 +82,8 @@ function onOwnHosting(c) {
 // - updated_at はサーバの時刻（serverTimestamp）でなければ書けません。端末の時計に依存しないためです
 // - **削除は禁止です。** 削除は deleted_at を立てて表します（墓標）。ドキュメントを消すと、
 //   消したことが他の端末に伝わりません
+// - apiTokens / inbox は「API でカードを追加」用です（importInbox の説明）。inbox だけは
+//   ログインしていない書き込みを受け付けますが、本人が発行したトークンを持っているときだけです
 const RULES_SETUP = [
   "rules_version = '2';",
   "service cloud.firestore {",
@@ -92,9 +94,25 @@ const RULES_SETUP = [
   "        && request.resource.data.updated_at == request.time;",
   "      allow delete: if false;",
   "    }",
+  "    match /users/{uid}/apiTokens/{token} {",
+  "      allow read, create, delete: if request.auth != null && request.auth.uid == uid;",
+  "    }",
+  "    match /users/{uid}/inbox/{id} {",
+  "      allow create: if request.resource.data.keys().hasOnly(['token', 'deck', 'cards', 'front', 'back', 'hint'])",
+  "        && request.resource.data.token is string",
+  "        && request.resource.data.token.matches('^[A-Za-z0-9_-]{20,64}$')",
+  "        && exists(/databases/$(database)/documents/users/$(uid)/apiTokens/$(request.resource.data.token))",
+  "        && (!('cards' in request.resource.data)",
+  "            || (request.resource.data.cards is list && request.resource.data.cards.size() <= 200));",
+  "      allow read, delete: if request.auth != null && request.auth.uid == uid;",
+  "    }",
   "  }",
   "}",
 ].join("\n");
+
+// API で追加したカードの入り先（デッキ名を指定しなかったとき）と、文字数の上限。
+const API_DECK = "API で追加";
+const API_TEXT_MAX = 2000; // 表・裏・補足それぞれの文字数の上限
 
 // Firestore のドキュメントID。kind と項目のIDをつなぎます。
 // ID に "/" が入ると階層の区切りとみなされるので、念のため符号化します。
@@ -455,6 +473,7 @@ class App extends Component {
     booting: false, // 保存済みセッションの復元待ち。ログイン画面のちらつき防止
     localOnly: false, // 「この端末だけで使う」を選んだ
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
+    apiToken: null, // API でカードを追加するためのトークン（同期画面で発行）
     movedBackend: false, // Supabase から移った直後で、まだ Firebase にログインしていない
     rulesNeeded: false, // Firestore の準備（データベース作成・ルール）がまだなので、ルールを出す
   };
@@ -1639,6 +1658,8 @@ class App extends Component {
       const kit = await this.loadFb();
       const F = kit.F;
       await this.seedCounts(kit);
+      // API で届いたカードがあれば先に取り込みます（開いていない間に届いた分）。
+      if (this.state.screen !== "study") await this.importInbox(kit);
       let from = this.cursor();
       let got = 0;
       // 1回で取り切れないほど溜まっていることがあるので、続きがある限り繰り返します。
@@ -1788,6 +1809,9 @@ class App extends Component {
   // 自分が書いた直後の「まだサーバに届いていない」版（hasPendingWrites）は飛ばします。
   // updated_at がまだ入っていないので、順序の判断に使えません。
   async subscribeRealtime() {
+    // API で追加されたカードの受け取り（importInbox の説明）も、ここで一緒に始めます。
+    this.subscribeInbox();
+    this.loadApiToken();
     if (this._fbListener || !this._syncUserEmail) return;
     try {
       const kit = await this.loadFb();
@@ -1819,6 +1843,201 @@ class App extends Component {
       if (this._fbListener) this._fbListener();
     } catch (e) {}
     this._fbListener = null;
+    try {
+      if (this._inboxListener) this._inboxListener();
+    } catch (e) {}
+    this._inboxListener = null;
+  }
+
+  // ---- API でカードを追加 ----
+  //
+  // サーバーを持たない（無料プランのまま）ための形です。
+  // 1. 同期画面で API トークンを発行すると users/{uid}/apiTokens/{トークン} ができます
+  // 2. AI などの外部は Firestore の REST API で users/{uid}/inbox に書き込みます（ログイン不要）。
+  //    ルールが「本人が発行したトークンが付いているか」を確かめます
+  // 3. アプリ（ログイン中）が inbox を見つけたらカードにして、inbox からは消します
+  // inbox は同期の項目（items）ではないので、取り込んだら消してかまいません。
+  // カードの ID は inbox のドキュメントID から作るので、2台が同時に取り込んでも同じカードになります。
+
+  async loadApiToken() {
+    if (!this._syncUserEmail) return;
+    try {
+      const kit = await this.loadFb();
+      const F = kit.F;
+      const snap = await F.getDocsFromServer(F.collection(kit.db, "users", this.fbUid(kit), "apiTokens"));
+      const t = snap.docs.length ? snap.docs[0].id : null;
+      if (this.state.apiToken !== t) this.setState({ apiToken: t });
+    } catch (e) {
+      // ルールが古い（apiTokens を許可していない）ときもここに来ます。発行を押したときに理由を出します。
+    }
+  }
+
+  // トークンは 1 本だけ持ちます。発行し直すと古いものは使えなくなります。
+  async issueApiToken() {
+    this.setState({ syncBusy: true, syncError: null });
+    try {
+      const kit = await this.loadFb();
+      const F = kit.F;
+      const col = F.collection(kit.db, "users", this.fbUid(kit), "apiTokens");
+      const bytes = new Uint8Array(24);
+      crypto.getRandomValues(bytes);
+      const token = btoa(String.fromCharCode.apply(null, bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const old = await F.getDocsFromServer(col);
+      const batch = F.writeBatch(kit.db);
+      old.docs.forEach((d) => batch.delete(d.ref));
+      batch.set(F.doc(col, token), { created_at: F.serverTimestamp() });
+      await batch.commit();
+      this.setState({ apiToken: token, syncBusy: false });
+      this.toast("API トークンを発行しました");
+      this.subscribeInbox();
+    } catch (e) {
+      this.setState({ syncBusy: false });
+      this.syncFail(e);
+    }
+  }
+
+  async revokeApiToken() {
+    this.setState({ syncBusy: true, syncError: null });
+    try {
+      const kit = await this.loadFb();
+      const F = kit.F;
+      const old = await F.getDocsFromServer(F.collection(kit.db, "users", this.fbUid(kit), "apiTokens"));
+      const batch = F.writeBatch(kit.db);
+      old.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+      this.setState({ apiToken: null, syncBusy: false });
+      this.toast("API トークンを無効にしました");
+    } catch (e) {
+      this.setState({ syncBusy: false });
+      this.syncFail(e);
+    }
+  }
+
+  // inbox に届いたものを待ち受けます。アプリを開いている間は、届いたらすぐ取り込みます。
+  async subscribeInbox() {
+    if (this._inboxListener || !this._syncUserEmail) return;
+    try {
+      const kit = await this.loadFb();
+      const F = kit.F;
+      this._inboxListener = F.onSnapshot(
+        F.collection(kit.db, "users", this.fbUid(kit), "inbox"),
+        (snap) => {
+          if (!snap.empty && this.canSyncNow()) this.importInbox();
+        },
+        () => {
+          this._inboxListener = null; // ルールが古いときなど。pull() のたびにも見に行くので困りません
+        }
+      );
+    } catch (e) {
+      this._inboxListener = null;
+    }
+  }
+
+  // inbox の中身をカードにします。1件は「1枚（front/back/hint）」か「まとめて（cards の配列）」。
+  // 中身は外から来たものなので、文字列以外は捨て、長すぎる文字は切り、表か裏が空のものは飛ばします。
+  // 重複の判定は一括取り込みと同じく「同じデッキに同じ表があるか」です。
+  async importInbox(kitArg) {
+    if (!this._syncUserEmail || this._importingInbox) return 0;
+    this._importingInbox = true;
+    try {
+      const kit = kitArg || (await this.loadFb());
+      const F = kit.F;
+      const col = F.collection(kit.db, "users", this.fbUid(kit), "inbox");
+      const snap = await F.getDocsFromServer(F.query(col, F.limit(50)));
+      if (snap.empty) return 0;
+      const str = (v) => (typeof v === "string" ? v.trim().slice(0, API_TEXT_MAX) : "");
+      const saved = this.savedData();
+      const decks = (saved.decks || []).slice();
+      const cards = (saved.cards || []).slice();
+      const haveId = new Set(cards.map((c) => c.id));
+      let added = 0;
+      snap.docs.forEach((d) => {
+        const x = d.data() || {};
+        const deckName = str(x.deck).slice(0, 100) || API_DECK;
+        let deck = decks.find((k) => (k.name || "").trim() === deckName);
+        if (!deck) {
+          // 2台で同時に取り込んでも同じデッキになるよう、ID は名前から決めます。
+          const id = "dapi" + hashOf(deckName).replace(/[^a-z0-9]/g, "");
+          deck = decks.find((k) => k.id === id);
+          if (!deck) {
+            deck = { id, name: deckName, sub: "API で追加したカード" };
+            decks.push(deck);
+          }
+        }
+        const fronts = new Set(cards.filter((c) => c.deckId === deck.id).map((c) => (c.front || "").trim()));
+        const list = Array.isArray(x.cards) ? x.cards.slice(0, 200) : [{ front: x.front, back: x.back, hint: x.hint }];
+        list.forEach((raw, i) => {
+          const r = raw && typeof raw === "object" ? raw : {};
+          const front = str(r.front);
+          const back = str(r.back);
+          const id = "capi" + d.id + "_" + i;
+          if (!front || !back || fronts.has(front) || haveId.has(id)) return;
+          const c = this.newCard(deck.id, front, back, str(r.hint));
+          c.id = id;
+          cards.push(c);
+          fronts.add(front);
+          haveId.add(id);
+          added++;
+        });
+      });
+      if (added) {
+        const next = { decks, cards };
+        this.setState(next);
+        this.persist(next);
+        this.toast("API から " + added + " 枚追加しました");
+      }
+      // 取り込んだら inbox から消します（カードは persist で items として同期されます）。
+      const batch = F.writeBatch(kit.db);
+      snap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+      return added;
+    } catch (e) {
+      return 0; // ルールが古いときなど。カードの同期そのものは止めません
+    } finally {
+      this._importingInbox = false;
+    }
+  }
+
+  // AI に渡す説明文。送り先・トークン・書き方の例をまとめて、そのまま貼れる形にします。
+  apiGuide() {
+    const c = this.cfg();
+    const kit = this._fbKit;
+    const who = kit && kit.auth.currentUser ? kit.auth.currentUser.uid : "";
+    const url =
+      "https://firestore.googleapis.com/v1/projects/" + c.projectId +
+      "/databases/(default)/documents/users/" + who + "/inbox?key=" + c.apiKey;
+    const body = {
+      fields: {
+        token: { stringValue: this.state.apiToken || "" },
+        deck: { stringValue: "デッキ名" },
+        cards: {
+          arrayValue: {
+            values: [
+              { mapValue: { fields: { front: { stringValue: "表" }, back: { stringValue: "裏" }, hint: { stringValue: "補足（任意）" } } } },
+            ],
+          },
+        },
+      },
+    };
+    return [
+      "暗記カードアプリ「キオク」にカードを追加する API です。次の形で送ってカードを追加してください。",
+      "",
+      "■ 送り先（HTTP POST、Content-Type: application/json）",
+      url,
+      "",
+      "■ 本文（Firestore REST API の形式）",
+      JSON.stringify(body, null, 2),
+      "",
+      "■ 決まりごと",
+      "- token はこのまま送ってください（変えると 403 になります）",
+      "- deck はデッキ名です。同じ名前のデッキがあればそこに、なければ新しく作って入れます。省くと「" + API_DECK + "」に入ります",
+      "- cards の中の front（表）と back（裏）は必須、hint（補足）は任意です。1回に200枚まで。多いときは分けて送ってください",
+      "- 同じデッキに同じ表のカードがあるときは追加されません",
+      "- 成功すると 200 が返ります。カードはアプリを開いたときに取り込まれます",
+      "",
+      "■ curl の例",
+      "curl -X POST '" + url + "' -H 'Content-Type: application/json' -d '" + JSON.stringify(body) + "'",
+    ].join("\n");
   }
 
   // 同期の控えを捨てます。学習データ（kioku.mvp.v1）には触りません。
@@ -4234,6 +4453,67 @@ class App extends Component {
                   <button class="soft" style=${secondary} onClick=${() => this.push(true)}>この端末の内容を送る</button>
                 </div>
               </div>`}
+        </div>`}
+
+        ${s.syncUser &&
+        html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>API でカードを追加</div>
+          <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.7, marginBottom: 14 }}>
+            AI（Claude Code など、プログラムを実行できるもの）からカードを送れるようにします。
+            トークンを発行して「AI に渡す説明をコピー」を押し、そのまま AI に貼ってください。
+            届いたカードは、アプリを開いたときに取り込まれます。
+          </div>
+          ${s.apiToken
+            ? html`<div style=${{ display: "grid", gap: 10 }}>
+                <div
+                  style=${{
+                    background: C.field,
+                    border: "1px solid " + C.lineSoft,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                    fontSize: 12,
+                    color: C.inkSoft,
+                    wordBreak: "break-all",
+                  }}
+                >
+                  ${s.apiToken}
+                </div>
+                <div style=${{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    class="cta"
+                    style=${primary}
+                    onClick=${() => {
+                      const text = this.apiGuide();
+                      if (navigator.clipboard)
+                        navigator.clipboard.writeText(text).then(
+                          () => this.toast("AI に渡す説明をコピーしました"),
+                          () => this.toast("コピーできませんでした")
+                        );
+                    }}
+                  >
+                    AI に渡す説明をコピー
+                  </button>
+                  <button class="soft" style=${secondary} disabled=${s.syncBusy} onClick=${() => this.issueApiToken()}>
+                    発行し直す
+                  </button>
+                  <button
+                    class="danger"
+                    style=${Object.assign({}, secondary, { background: "none", color: C.faint })}
+                    disabled=${s.syncBusy}
+                    onClick=${() => this.revokeApiToken()}
+                  >
+                    無効にする
+                  </button>
+                </div>
+                <div style=${{ fontSize: 11, color: C.faint, lineHeight: 1.7 }}>
+                  このトークンを知っている人は、あなたのアカウントにカードを追加できます（読み取りや削除はできません）。
+                  漏れたかもしれないときは「発行し直す」を押してください。
+                </div>
+              </div>`
+            : html`<button class="soft" style=${secondary} disabled=${s.syncBusy} onClick=${() => this.issueApiToken()}>
+                API トークンを発行
+              </button>`}
         </div>`}
 
         <div style=${box}>
