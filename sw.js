@@ -1,4 +1,4 @@
-const CACHE = 'kioku-v36';
+const CACHE = 'kioku-v37';
 const ASSETS = [
   './',
   './index.html',
@@ -56,8 +56,8 @@ self.addEventListener('fetch', (e) => {
 
   if (isShell) {
     e.respondWith(
-      // GitHub Pages は Cache-Control ヘッダを設定できず、既定で10分ほど HTTP キャッシュが効く。
-      // cache: 'reload' でそれを迂回し、更新をこれまでどおりすぐ拾えるようにする。
+      // cache: 'reload' で HTTP キャッシュを迂回し、更新をすぐ拾えるようにする
+      // （firebase.json でも no-cache にしているが、ヘッダが効かない環境への保険として残す）。
       fetch(e.request.url, { cache: 'reload', credentials: 'same-origin' })
         .then((res) => {
           const copy = res.clone();

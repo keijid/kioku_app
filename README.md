@@ -25,7 +25,9 @@ app.js                  アプリ全体（Preact + htm、1ファイル）
 sw.js                   Service Worker（オフラインキャッシュ）
 manifest.webmanifest    PWA マニフェスト
 icon-*.png              アプリアイコン
-.nojekyll               GitHub Pages の Jekyll 処理を止める空ファイル
+firebase.json           Firebase Hosting の公開設定
+.firebaserc             Firebase のプロジェクトID
+.github/workflows/      main への push で Firebase Hosting に公開
 CLAUDE.md               開発ガイド（設計方針・アルゴリズム・注意点）
 ```
 
@@ -46,44 +48,22 @@ python3 -m http.server 8000
 
 詳しい設計方針・データ構造・学習アルゴリズム・やってはいけないことは [CLAUDE.md](./CLAUDE.md) にまとめてあります。
 
-## デプロイ（GitHub Pages）
+## デプロイ（Firebase Hosting）
 
-main への push で自動デプロイされます。Settings → Pages の Source は
-「Deploy from a branch」で `main` / `/ (root)`。ビルド工程はありません。
+main への push で GitHub Actions が Firebase Hosting に公開します。ビルド工程はありません。
 
-公開URL: `https://keijid.github.io/kioku_app/`
+公開URL: `https://kioku-b32ba.web.app/`
 
-サブパス配信のため、アプリ内の参照はすべて `./` の相対パスにしてあります。
-絶対パスに書き換えると動かなくなります。
+リポジトリの Secrets に `FIREBASE_SERVICE_ACCOUNT`（サービスアカウント鍵 JSON）が必要です。
+サービスアカウントには「Firebase Hosting 管理者」「Service Usage ユーザー」「API キー閲覧者」のロールを付けます。
 
-## 同期（任意・Supabase）
+## 同期（任意・Firebase）
 
-設定しない場合、学習データは端末内にのみ保存されます。複数端末で同期する場合：
+設定しない場合、学習データは端末内にのみ保存されます。既定の保存先（Firebase プロジェクト `kioku-b32ba`）は
+`app.js` の `DEFAULT_FB` に入っており、ログインするだけで複数端末で同期できます（Google またはメールアドレス）。
 
-1. [Supabase](https://supabase.com) で無料プロジェクトを作成
-2. SQL Editor で以下を実行
-
-```sql
-create table if not exists kioku_state (
-  user_id uuid primary key references auth.users on delete cascade,
-  data jsonb not null,
-  updated_at timestamptz not null default now()
-);
-alter table kioku_state enable row level security;
-drop policy if exists "own rows" on kioku_state;
-create policy "own rows" on kioku_state
-  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-```
-
-3. Project Settings → API から **Project URL** と **Publishable key**（`sb_publishable_…`／旧 anon key）をコピー
-   - Secret key は使用しません
-4. アプリの「同期」画面に貼り付けて保存 → メールアドレスとパスワードで登録・ログイン
-
-補足：
-- Authentication → Sign In / Providers → Email の **Confirm email** を OFF にすると、確認メールなしで登録できます
-- Authentication → URL Configuration の **Site URL** を公開URLにしておくと、確認メールのリンクが正しく戻ります
-- データは行単位セキュリティ（RLS）で保護され、各ユーザーは自分の行のみ読み書きできます
-- 競合は「後に書いた方が勝つ」方式（last-write-wins）です
+自分の Firebase プロジェクトを使う場合は、アプリの「同期」画面 →「別の保存先を使う」の手順に従い、
+Firestore のルールを貼ってから firebaseConfig を貼り付けます。設計の詳細は [CLAUDE.md](./CLAUDE.md) の「同期」の節にあります。
 
 ## ライセンス
 

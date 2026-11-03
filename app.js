@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v36";
+const BUILD = "v37";
 
 const C = {
   bg: "#F3EFE6",
@@ -58,11 +58,6 @@ const DEFAULT_FB = {
   projectId: "kioku-b32ba",
   appId: "1:398583079920:web:80ca7c6e8effbe1c35b335",
 };
-
-// 引っ越し先のアドレス。GitHub Pages（旧サイト）で開いたときだけ、ホームに移転の案内を出します。
-// 空のあいだは案内を出しません。旧サイトも main から同じ app.js で公開されるので、ホスト名で見分けます。
-const OLD_HOST = "keijid.github.io";
-const NEW_HOME = "";
 
 // Firebase Hosting で公開しているページか（このプロジェクトの web.app / firebaseapp.com）。
 // そうなら、ログイン処理（/__/auth/handler）がアプリと同じドメインに載っているので、
@@ -1282,7 +1277,7 @@ class App extends Component {
   // Google ログイン。
   // - Firebase Hosting で開いているとき：ページ移動（リダイレクト）方式。iPhone のホーム画面アプリでも
   //   完了します。戻ってきたあとは initSync() が結果を受け取ります（kioku.redirecting の印）
-  // - それ以外（GitHub Pages の旧サイトなど）：ポップアップ方式。リダイレクトは別ドメインだと
+  // - それ以外（手元の localhost など）：ポップアップ方式。リダイレクトは別ドメインだと
   //   最近のブラウザで動かないため使えません
   // ポップアップは「押した直後」に開かないとブラウザに止められるので、SDK は先に読み込んでおき、
   // ここでは await を挟まずに signInWithPopup を呼びます。
@@ -2263,33 +2258,6 @@ class App extends Component {
 
     return html`
       <main style=${{ maxWidth: 900, margin: "0 auto", animation: "kk-rise .3s ease both" }}>
-        ${NEW_HOME &&
-        location.hostname === OLD_HOST &&
-        html`<div
-          style=${{
-            background: C.surface,
-            border: "1px solid " + C.accent,
-            borderRadius: 14,
-            padding: "14px 16px",
-            marginBottom: 16,
-            fontSize: 13,
-            color: C.inkSoft,
-            lineHeight: 1.7,
-          }}
-        >
-          <div style=${{ fontWeight: 700, marginBottom: 4 }}>キオクは新しいアドレスに移りました</div>
-          <div>
-            ${s.syncUser
-              ? "この端末の学習データはクラウドに保存済みです。新しいアドレスを開いて、同じアカウントでログインしてください。"
-              : "この端末の学習データは、このアドレスの中にだけ保存されています。先にここでログインして同期してから、新しいアドレスを開いて同じアカウントでログインしてください。"}
-            ホーム画面に追加している場合は、新しいアドレスで追加し直してください。
-          </div>
-          <a
-            href=${NEW_HOME}
-            style=${{ display: "inline-block", marginTop: 8, color: C.accentDeep, fontWeight: 700, wordBreak: "break-all" }}
-            >${NEW_HOME}</a
-          >
-        </div>`}
         ${!s.syncUser &&
         !!this.cfg() &&
         html`<div

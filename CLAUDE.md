@@ -27,7 +27,6 @@ app.js       アプリ全体（1ファイル）。Preact + htm。
 sw.js        Service Worker。app.js/index.html は network-first、他は cache-first。
 manifest.webmanifest
 icon-*.png
-.nojekyll    GitHub Pages に Jekyll 処理をさせないための空ファイル（旧サイト用）
 firebase.json                       Firebase Hosting の公開設定（キャッシュのヘッダ）
 .firebaserc                         Firebase のプロジェクトID
 .github/workflows/firebase-hosting.yml  main への push で Firebase Hosting に公開
@@ -403,7 +402,7 @@ Firebase の API（`*.googleapis.com`）はどちらでもないので、素通�
     `loadFb()` が `authDomain` をいま開いているドメインに差し替えるので、ログイン処理（`/__/auth/handler`）が
     アプリと同じドメインに載り、iPhone のホーム画面アプリでも完了します。戻ってきたことは
     sessionStorage の `kioku.redirecting` で知り、`initSync()` が `getRedirectResult()` で結果（失敗理由も）を受け取ります
-  - **それ以外（GitHub Pages の旧サイトなど）**：`signInWithPopup`。別ドメインのリダイレクトは
+  - **それ以外（手元の localhost など）**：`signInWithPopup`。別ドメインのリダイレクトは
     最近のブラウザで動きません。SDK を先に読み込んでおき、await を挟まずにポップアップを開きます
 - エラーは `authErrText()` が `code` を日本語にします
 - セッションは `browserLocalPersistence`（localStorage の `firebase:authUser:…`）に置きます。
@@ -412,8 +411,10 @@ Firebase の API（`*.googleapis.com`）はどちらでもないので、素通�
 
 Firebase 側で必要な設定（コードの外）：Firestore Database を作成してルールを貼る。
 Authentication → Sign-in method で「メール / パスワード」と「Google」を有効にする。
-Authentication → 設定 → 承認済みドメインに `keijid.github.io`（旧サイト。ローカル確認なら `localhost`）を足す。
-`<projectId>.web.app` と `.firebaseapp.com` は最初から入っています。
+`<projectId>.web.app` と `.firebaseapp.com` は Authentication の承認済みドメインに最初から入っています。
+**Google Cloud コンソールの OAuth クライアント（Web client (auto created by Google Service)）の
+「承認済みのリダイレクト URI」に `https://<projectId>.web.app/__/auth/handler` を足す必要があります。**
+最初から入っているのは firebaseapp.com の方だけで、足さないと web.app で `redirect_uri_mismatch` になります。
 
 ### 手元での確認（エミュレータ）
 
@@ -452,29 +453,23 @@ Authentication → 設定 → 承認済みドメインに `keijid.github.io`（�
 
 ## デプロイ
 
-**Firebase Hosting** に公開します（2026-11 に GitHub Pages から移行中）。ビルド工程は無しのままです。
+**Firebase Hosting**（`https://kioku-b32ba.web.app/`）に公開します。ビルド工程は無しのままです。
+2026-11 に GitHub Pages（`keijid.github.io/kioku_app/`）から移りました。旧サイトは使っていません。
 
 - main への push で `.github/workflows/firebase-hosting.yml` がリポジトリのファイルをそのまま上げます。
   公開しないファイルは `firebase.json` の `ignore` に書きます（CLAUDE.md・README・ドットファイル）
 - 必要なもの：リポジトリの Secrets の `FIREBASE_SERVICE_ACCOUNT`（Firebase Hosting 管理者権限の
-  サービスアカウント鍵 JSON）と、`.firebaserc` のプロジェクトID。Secret が無いあいだは何もせずに終わります
+  サービスアカウント鍵 JSON）と、`.firebaserc` のプロジェクトID。Secret が無いあいだは何もせずに終わります。
+  サービスアカウントのロールは「Firebase Hosting 管理者」「Service Usage ユーザー」「API キー閲覧者」。
+  Hosting 管理者だけだと、公開前の確認（serviceusage.services.get）で 403 になります
 - キャッシュは `firebase.json` の `headers` で指定します。`index.html` / `*.js` / `manifest.webmanifest` / `sw.js` は
   `no-cache`（毎回更新を確かめる）、アイコンは1日です。**`sw.js` を長くキャッシュさせないでください。**
   Service Worker の更新が届かなくなり、古い版から抜けられなくなります
 
-### 旧サイト（GitHub Pages）
+`index.html`・`manifest.webmanifest`・`sw.js` の参照は `./` の相対パスにしてあります（旧サイトがサブパス配信だった名残。
+ルート配信でもそのまま動くので、このままにしています）。
 
-`https://keijid.github.io/kioku_app/`（Settings → Pages、`main` / `/ (root)`）。main から同じファイルが
-公開され続けます。**localStorage はドメインごとに別**なので、旧サイトの端末内データは新サイトから見えません。
-そのため移行期間は旧サイトも動かしたままにし、`NEW_HOME` に新しいアドレスを入れると、旧サイト
-（`OLD_HOST`）で開いたときだけホームに移転の案内が出ます（ログインして同期してから移るよう促す）。
-十分に移ったら GitHub Pages を止めます。
-
-旧サイトはサブパス配信なので、`index.html`・`manifest.webmanifest`・`sw.js` の参照はすべて `./` の相対パスです。
-**絶対パス（`/app.js` など）に書き換えないでください。** 旧サイトが壊れます。
-
-GitHub Pages は `Cache-Control` ヘッダを設定できないため、`sw.js` の network-first 側で
-`fetch(url, { cache: 'reload' })` を使い、HTTPキャッシュを迂回して更新を拾っています。
+`sw.js` の network-first 側は `fetch(url, { cache: 'reload' })` で HTTP キャッシュを迂回して更新を拾います。
 ここを素の `fetch(e.request)` に戻さないでください。
 
 **変更を出すときのチェックリスト**
