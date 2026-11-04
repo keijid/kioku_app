@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v40";
+const BUILD = "v41";
 
 const C = {
   bg: "#F3EFE6",
@@ -82,7 +82,7 @@ function onOwnHosting(c) {
 // - updated_at はサーバの時刻（serverTimestamp）でなければ書けません。端末の時計に依存しないためです
 // - **削除は禁止です。** 削除は deleted_at を立てて表します（墓標）。ドキュメントを消すと、
 //   消したことが他の端末に伝わりません
-// - apiTokens / inbox は「API でカードを追加」用です（importInbox の説明）。inbox だけは
+// - apiTokens / inbox は「API でカードを追加・削除」用です（importInbox の説明）。inbox だけは
 //   ログインしていない書き込みを受け付けますが、本人が発行したトークンを持っているときだけです
 const RULES_SETUP = [
   "rules_version = '2';",
@@ -98,12 +98,14 @@ const RULES_SETUP = [
   "      allow read, create, delete: if request.auth != null && request.auth.uid == uid;",
   "    }",
   "    match /users/{uid}/inbox/{id} {",
-  "      allow create: if request.resource.data.keys().hasOnly(['token', 'deck', 'cards', 'front', 'back', 'hint'])",
+  "      allow create: if request.resource.data.keys().hasOnly(['token', 'deck', 'cards', 'front', 'back', 'hint', 'delete'])",
   "        && request.resource.data.token is string",
   "        && request.resource.data.token.matches('^[A-Za-z0-9_-]{20,64}$')",
   "        && exists(/databases/$(database)/documents/users/$(uid)/apiTokens/$(request.resource.data.token))",
   "        && (!('cards' in request.resource.data)",
-  "            || (request.resource.data.cards is list && request.resource.data.cards.size() <= 200));",
+  "            || (request.resource.data.cards is list && request.resource.data.cards.size() <= 200))",
+  "        && (!('delete' in request.resource.data)",
+  "            || (request.resource.data['delete'] is list && request.resource.data['delete'].size() <= 200));",
   "      allow read, delete: if request.auth != null && request.auth.uid == uid;",
   "    }",
   "  }",
@@ -1936,6 +1938,10 @@ class App extends Component {
   // inbox の中身をカードにします。1件は「1枚（front/back/hint）」か「まとめて（cards の配列）」。
   // 中身は外から来たものなので、文字列以外は捨て、長すぎる文字は切り、表か裏が空のものは飛ばします。
   // 重複の判定は一括取り込みと同じく「同じデッキに同じ表があるか」です。
+  // delete（表の文字列の配列）があれば、そのデッキで表が一致するカードを消します。
+  // 1件の中では「削除 → 追加」の順なので、同じ表を delete と cards に並べれば差し替えになります。
+  // 別々に送られた件どうしの順序は保証しません（inbox のIDはランダムで、届いた順が分からないため）。
+  // 消したカードは persist で墓標（deleted_at）として同期されます。
   async importInbox(kitArg) {
     if (!this._syncUserEmail || this._importingInbox) return 0;
     this._importingInbox = true;
@@ -1948,9 +1954,10 @@ class App extends Component {
       const str = (v) => (typeof v === "string" ? v.trim().slice(0, API_TEXT_MAX) : "");
       const saved = this.savedData();
       const decks = (saved.decks || []).slice();
-      const cards = (saved.cards || []).slice();
+      let cards = (saved.cards || []).slice();
       const haveId = new Set(cards.map((c) => c.id));
       let added = 0;
+      let removed = 0;
       snap.docs.forEach((d) => {
         const x = d.data() || {};
         const deckName = str(x.deck).slice(0, 100) || API_DECK;
@@ -1964,8 +1971,20 @@ class App extends Component {
             decks.push(deck);
           }
         }
+        // 削除（表が完全に一致するもの）。削除だけの件で上でデッキを作っていても、下で取り除きます。
+        const del = Array.isArray(x.delete) ? x.delete.slice(0, 200).map(str).filter(Boolean) : [];
+        if (del.length) {
+          const gone = new Set(del);
+          const before = cards.length;
+          cards = cards.filter((c) => !(c.deckId === deck.id && gone.has((c.front || "").trim())));
+          removed += before - cards.length;
+        }
         const fronts = new Set(cards.filter((c) => c.deckId === deck.id).map((c) => (c.front || "").trim()));
-        const list = Array.isArray(x.cards) ? x.cards.slice(0, 200) : [{ front: x.front, back: x.back, hint: x.hint }];
+        const list = Array.isArray(x.cards)
+          ? x.cards.slice(0, 200)
+          : x.front !== undefined || x.back !== undefined
+          ? [{ front: x.front, back: x.back, hint: x.hint }]
+          : [];
         list.forEach((raw, i) => {
           const r = raw && typeof raw === "object" ? raw : {};
           const front = str(r.front);
@@ -1980,11 +1999,19 @@ class App extends Component {
           added++;
         });
       });
-      if (added) {
-        const next = { decks, cards };
-        this.setState(next);
+      // 削除だけの件で、存在しないデッキ名が来たときに作った空のデッキは残しません。
+      const used = new Set(cards.map((c) => c.deckId));
+      const savedDeckIds = new Set((saved.decks || []).map((k) => k.id));
+      const nextDecks = decks.filter((k) => savedDeckIds.has(k.id) || used.has(k.id));
+      if (added || removed) {
+        const next = { decks: nextDecks, cards };
+        const editGone = this.state.editId && !cards.some((c) => c.id === this.state.editId);
+        this.setState(editGone ? Object.assign({ editId: null }, next) : next);
         this.persist(next);
-        this.toast("API から " + added + " 枚追加しました");
+        const parts = [];
+        if (added) parts.push(added + " 枚追加");
+        if (removed) parts.push(removed + " 枚削除");
+        this.toast("API から " + parts.join("・") + "しました");
       }
       // 取り込んだら inbox から消します（カードは persist で items として同期されます）。
       const batch = F.writeBatch(kit.db);
@@ -2019,8 +2046,15 @@ class App extends Component {
         },
       },
     };
+    const delBody = {
+      fields: {
+        token: { stringValue: this.state.apiToken || "" },
+        deck: { stringValue: "デッキ名" },
+        delete: { arrayValue: { values: [{ stringValue: "消したいカードの表" }] } },
+      },
+    };
     return [
-      "暗記カードアプリ「キオク」にカードを追加する API です。次の形で送ってカードを追加してください。",
+      "暗記カードアプリ「キオク」のカードを追加・削除する API です。次の形で送ってください。",
       "",
       "■ 送り先（HTTP POST、Content-Type: application/json）",
       url,
@@ -2034,9 +2068,21 @@ class App extends Component {
       "- cards の中の front（表）と back（裏）は必須、hint（補足）は任意です。1回に200枚まで。多いときは分けて送ってください",
       "- 同じデッキに同じ表のカードがあるときは追加されません",
       "- 成功すると 200 が返ります。カードはアプリを開いたときに取り込まれます",
+      "- カードの一覧を読み取ることはできません",
       "",
-      "■ curl の例",
+      "■ 削除",
+      "fields に delete（消したいカードの表の文字列の配列）を入れます。deck のデッキの中で、表が完全に一致するカードを消します。",
+      "deck を省くと「" + API_DECK + "」が対象です。1回に200件まで。一致するカードが無いものは何もしません。",
+      JSON.stringify(delBody, null, 2),
+      "- delete と cards を同じ本文に入れると「削除 → 追加」の順に行います。カードの裏や補足を直したいときは、",
+      "  同じ表を delete と cards の両方に入れて1回で送ってください（別々に送ると順番が入れ替わることがあります）",
+      "- 削除した学習の記録は戻せません",
+      "",
+      "■ curl の例（追加）",
       "curl -X POST '" + url + "' -H 'Content-Type: application/json' -d '" + JSON.stringify(body) + "'",
+      "",
+      "■ curl の例（削除）",
+      "curl -X POST '" + url + "' -H 'Content-Type: application/json' -d '" + JSON.stringify(delBody) + "'",
     ].join("\n");
   }
 
@@ -4457,11 +4503,11 @@ class App extends Component {
 
         ${s.syncUser &&
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
-          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>API でカードを追加</div>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>API でカードを追加・削除</div>
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.7, marginBottom: 14 }}>
-            AI（Claude Code など、プログラムを実行できるもの）からカードを送れるようにします。
+            AI（Claude Code など、プログラムを実行できるもの）からカードを追加・削除できるようにします。
             トークンを発行して「AI に渡す説明をコピー」を押し、そのまま AI に貼ってください。
-            届いたカードは、アプリを開いたときに取り込まれます。
+            届いた追加・削除は、アプリを開いたときに反映されます。
           </div>
           ${s.apiToken
             ? html`<div style=${{ display: "grid", gap: 10 }}>
@@ -4507,7 +4553,7 @@ class App extends Component {
                   </button>
                 </div>
                 <div style=${{ fontSize: 11, color: C.faint, lineHeight: 1.7 }}>
-                  このトークンを知っている人は、あなたのアカウントにカードを追加できます（読み取りや削除はできません）。
+                  このトークンを知っている人は、あなたのアカウントのカードを追加・削除できます（読み取りはできません）。
                   漏れたかもしれないときは「発行し直す」を押してください。
                 </div>
               </div>`

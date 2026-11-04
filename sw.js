@@ -1,4 +1,4 @@
-const CACHE = 'kioku-v40';
+const CACHE = 'kioku-v41';
 const ASSETS = [
   './',
   './index.html',
