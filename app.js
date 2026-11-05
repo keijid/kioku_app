@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v41";
+const BUILD = "v42";
 
 const C = {
   bg: "#F3EFE6",
@@ -84,6 +84,9 @@ function onOwnHosting(c) {
 //   消したことが他の端末に伝わりません
 // - apiTokens / inbox は「API でカードを追加・削除」用です（importInbox の説明）。inbox だけは
 //   ログインしていない書き込みを受け付けますが、本人が発行したトークンを持っているときだけです
+// - apiExport は「API でカードを取得」用です（writeApiExport の説明）。ドキュメントIDがトークンそのもので、
+//   トークンが今も有効なら、ログインしていなくても **get（IDを指定した1件読み）だけ**できます。
+//   list（一覧）は本人だけです。一覧を許すと、ID＝トークンが見えてしまいます
 const RULES_SETUP = [
   "rules_version = '2';",
   "service cloud.firestore {",
@@ -108,6 +111,14 @@ const RULES_SETUP = [
   "            || (request.resource.data['delete'] is list && request.resource.data['delete'].size() <= 200));",
   "      allow read, delete: if request.auth != null && request.auth.uid == uid;",
   "    }",
+  "    match /users/{uid}/apiExport/{token} {",
+  "      allow get: if exists(/databases/$(database)/documents/users/$(uid)/apiTokens/$(token));",
+  "      allow read, write: if request.auth != null && request.auth.uid == uid;",
+  "      match /parts/{part} {",
+  "        allow get: if exists(/databases/$(database)/documents/users/$(uid)/apiTokens/$(token));",
+  "        allow read, write: if request.auth != null && request.auth.uid == uid;",
+  "      }",
+  "    }",
   "  }",
   "}",
 ].join("\n");
@@ -115,6 +126,9 @@ const RULES_SETUP = [
 // API で追加したカードの入り先（デッキ名を指定しなかったとき）と、文字数の上限。
 const API_DECK = "API で追加";
 const API_TEXT_MAX = 2000; // 表・裏・補足それぞれの文字数の上限
+// 取得用の写し（apiExport）の1ドキュメントあたりの上限（UTF-8 のバイト数）。
+// Firestore の1ドキュメントは 1MiB までなので、余裕を見てこの大きさで分けます。
+const API_PART_BYTES = 700000;
 
 // Firestore のドキュメントID。kind と項目のIDをつなぎます。
 // ID に "/" が入ると階層の区切りとみなされるので、念のため符号化します。
@@ -475,7 +489,7 @@ class App extends Component {
     booting: false, // 保存済みセッションの復元待ち。ログイン画面のちらつき防止
     localOnly: false, // 「この端末だけで使う」を選んだ
     syncAdvanced: false, // 同期画面で「別の保存先を使う」を開いているか
-    apiToken: null, // API でカードを追加するためのトークン（同期画面で発行）
+    apiToken: null, // API でカードを追加・削除・取得するためのトークン（同期画面で発行）
     movedBackend: false, // Supabase から移った直後で、まだ Firebase にログインしていない
     rulesNeeded: false, // Firestore の準備（データベース作成・ルール）がまだなので、ルールを出す
   };
@@ -1767,6 +1781,9 @@ class App extends Component {
       this.syncFail(e);
     } finally {
       this._pushing = false;
+      // 取得 API 用の写しも書き直します。pull も最後に push を呼ぶので、受け取った変更もここで反映されます。
+      // 送るものが無くて早めに戻ったときも通ります。中身が変わっていなければ何も書きません。
+      this.writeApiExport();
     }
   }
 
@@ -1868,7 +1885,10 @@ class App extends Component {
       const F = kit.F;
       const snap = await F.getDocsFromServer(F.collection(kit.db, "users", this.fbUid(kit), "apiTokens"));
       const t = snap.docs.length ? snap.docs[0].id : null;
+      // 写しを書くときは this.state ではなくこちらを見ます（setState は次の描画まで反映されないため）。
+      this.apiTokenValue = t;
       if (this.state.apiToken !== t) this.setState({ apiToken: t });
+      this.writeApiExport();
     } catch (e) {
       // ルールが古い（apiTokens を許可していない）ときもここに来ます。発行を押したときに理由を出します。
     }
@@ -1889,9 +1909,15 @@ class App extends Component {
       old.docs.forEach((d) => batch.delete(d.ref));
       batch.set(F.doc(col, token), { created_at: F.serverTimestamp() });
       await batch.commit();
+      this.apiTokenValue = token;
+      this.apiExportHash = null;
+      this.apiExportAt = 0; // 発行した直後は待たずに書きます
       this.setState({ apiToken: token, syncBusy: false });
       this.toast("API トークンを発行しました");
       this.subscribeInbox();
+      // 古いトークンの写しを片付けてから、新しいトークンの場所に書き出します。
+      await this.clearApiExport(kit, old.docs.map((d) => d.id));
+      this.writeApiExport();
     } catch (e) {
       this.setState({ syncBusy: false });
       this.syncFail(e);
@@ -1907,12 +1933,131 @@ class App extends Component {
       const batch = F.writeBatch(kit.db);
       old.docs.forEach((d) => batch.delete(d.ref));
       await batch.commit();
+      this.apiTokenValue = null;
+      this.apiExportHash = null;
       this.setState({ apiToken: null, syncBusy: false });
       this.toast("API トークンを無効にしました");
+      await this.clearApiExport(kit, old.docs.map((d) => d.id));
     } catch (e) {
       this.setState({ syncBusy: false });
       this.syncFail(e);
     }
+  }
+
+  // ---- API でカードを取得 ----
+  //
+  // サーバーが無いので、外から「問い合わせに答える」ことはできません。代わりにアプリが
+  // カードの一覧の写しを users/{uid}/apiExport/{トークン}（目次）と .../parts/{0,1,...}（本体）に書き出し、
+  // 外部はトークンを使ってそれを読みます。ルールは「IDを指定した get」だけを許し、
+  // トークンが無効になれば読めなくなります（古い写しが残っていても読めません）。
+  // - 中身は JSON の文字列1つ（json フィールド）にしています。Firestore の型付き JSON のまま
+  //   カードを並べると、AI が読むには冗長すぎるためです
+  // - 本体は API_PART_BYTES ごとに分けます（1ドキュメント 1MiB の上限）
+  // - 書くのは push() の後（pull の後も含む）とトークン発行時です。前回と同じ中身なら書かず、
+  //   変わっていても60秒に1回までです（学習中の push のたびに全カードを送らないため）
+  // - 写しはアプリが開いて同期したときに更新されます。アプリを開いていない間の変更は反映されません
+  //   （別の端末で変えたものは、どれかの端末が同期すれば反映されます）
+  apiExportData() {
+    const d = this.savedData();
+    const decks = d.decks || [];
+    const name = {};
+    decks.forEach((k) => (name[k.id] = k.name || ""));
+    const cards = (d.cards || []).map((c) => ({
+      deck: name[c.deckId] || "",
+      front: c.front || "",
+      back: c.back || "",
+      hint: c.hint || "",
+      state: c.state || "new",
+      reps: c.reps || 0,
+      interval: c.interval || 0,
+      ease: c.ease || 0,
+      due: c.due ? dayKey(c.due) : "",
+    }));
+    const count = {};
+    cards.forEach((c) => (count[c.deck] = (count[c.deck] || 0) + 1));
+    return {
+      decks: decks.map((k) => ({ name: k.name || "", sub: k.sub || "", cards: count[k.name || ""] || 0 })),
+      cards,
+    };
+  }
+
+  async writeApiExport() {
+    const token = this.apiTokenValue;
+    if (!token || !this._syncUserEmail || this.apiExportBusy) return;
+    const data = this.apiExportData();
+    const h = hashOf([token, data]);
+    if (h === this.apiExportHash) return;
+    // 学習中は数秒ごとに push が走ります。そのたびに全カードを書き直すと通信量が大きいので、
+    // 書くのは60秒に1回までにして、間に来た分は最後にまとめて書きます。
+    const wait = 60000 - (Date.now() - (this.apiExportAt || 0));
+    if (wait > 0) {
+      if (!this.apiExportTimer)
+        this.apiExportTimer = setTimeout(() => {
+          this.apiExportTimer = null;
+          this.writeApiExport();
+        }, wait);
+      return;
+    }
+    this.apiExportBusy = true;
+    this.apiExportAt = Date.now();
+    try {
+      const kit = await this.loadFb();
+      const F = kit.F;
+      const parts = [];
+      let cur = [];
+      let size = 2;
+      const enc = new TextEncoder();
+      data.cards.forEach((c) => {
+        const n = enc.encode(JSON.stringify(c)).length + 1;
+        if (cur.length && size + n > API_PART_BYTES) {
+          parts.push(cur);
+          cur = [];
+          size = 2;
+        }
+        cur.push(c);
+        size += n;
+      });
+      if (cur.length || !parts.length) parts.push(cur);
+      const ref = F.doc(kit.db, "users", this.fbUid(kit), "apiExport", token);
+      const partsCol = F.collection(ref, "parts");
+      const old = await F.getDocsFromServer(partsCol);
+      const batch = F.writeBatch(kit.db);
+      parts.forEach((p, i) => batch.set(F.doc(partsCol, String(i)), { json: JSON.stringify(p) }));
+      old.docs.forEach((x) => {
+        if (!(Number(x.id) < parts.length)) batch.delete(x.ref);
+      });
+      batch.set(ref, {
+        json: JSON.stringify({
+          updated_at: new Date().toISOString(),
+          card_count: data.cards.length,
+          parts: parts.length,
+          decks: data.decks,
+        }),
+      });
+      await batch.commit();
+      // 書いている間にトークンが変わっていたら、控えは残しません（次の機会に書き直します）。
+      if (this.apiTokenValue === token) this.apiExportHash = h;
+    } catch (e) {
+      // ルールが古い（apiExport を許可していない）ときなど。カードの同期そのものは止めません。
+    } finally {
+      this.apiExportBusy = false;
+    }
+  }
+
+  // トークンを発行し直した・無効にしたときに、古いトークンの写しを消します。
+  // ルールでトークンの有無を見ているので残っていても読まれませんが、置きっぱなしにはしません。
+  async clearApiExport(kit, tokens) {
+    try {
+      const F = kit.F;
+      for (const t of tokens) {
+        const ref = F.doc(kit.db, "users", this.fbUid(kit), "apiExport", t);
+        const old = await F.getDocsFromServer(F.collection(ref, "parts"));
+        const batch = F.writeBatch(kit.db);
+        old.docs.forEach((x) => batch.delete(x.ref));
+        batch.delete(ref);
+        await batch.commit();
+      }
+    } catch (e) {}
   }
 
   // inbox に届いたものを待ち受けます。アプリを開いている間は、届いたらすぐ取り込みます。
@@ -2046,6 +2191,9 @@ class App extends Component {
         },
       },
     };
+    const readBase =
+      "https://firestore.googleapis.com/v1/projects/" + c.projectId +
+      "/databases/(default)/documents/users/" + who + "/apiExport/" + (this.state.apiToken || "");
     const delBody = {
       fields: {
         token: { stringValue: this.state.apiToken || "" },
@@ -2054,7 +2202,7 @@ class App extends Component {
       },
     };
     return [
-      "暗記カードアプリ「キオク」のカードを追加・削除する API です。次の形で送ってください。",
+      "暗記カードアプリ「キオク」のカードを追加・削除・取得する API です。",
       "",
       "■ 送り先（HTTP POST、Content-Type: application/json）",
       url,
@@ -2068,7 +2216,6 @@ class App extends Component {
       "- cards の中の front（表）と back（裏）は必須、hint（補足）は任意です。1回に200枚まで。多いときは分けて送ってください",
       "- 同じデッキに同じ表のカードがあるときは追加されません",
       "- 成功すると 200 が返ります。カードはアプリを開いたときに取り込まれます",
-      "- カードの一覧を読み取ることはできません",
       "",
       "■ 削除",
       "fields に delete（消したいカードの表の文字列の配列）を入れます。deck のデッキの中で、表が完全に一致するカードを消します。",
@@ -2078,11 +2225,28 @@ class App extends Component {
       "  同じ表を delete と cards の両方に入れて1回で送ってください（別々に送ると順番が入れ替わることがあります）",
       "- 削除した学習の記録は戻せません",
       "",
+      "■ 取得（HTTP GET）",
+      "まず目次を読みます。",
+      readBase + "?key=" + c.apiKey,
+      "返ってくる JSON の fields.json.stringValue が、さらに JSON の文字列です。中身は",
+      '{"updated_at":"写しを作った時刻","card_count":総枚数,"parts":本体の数,"decks":[{"name":"デッキ名","sub":"説明","cards":枚数}]}',
+      "次に本体を parts の数だけ読みます（0 から順に。ふつうは 0 だけです）。",
+      readBase + "/parts/0?key=" + c.apiKey,
+      "こちらも fields.json.stringValue が JSON の文字列で、カードの配列です。1枚は",
+      '{"deck":"デッキ名","front":"表","back":"裏","hint":"補足","state":"new|learning|review","reps":復習回数,"interval":間隔の日数,"ease":易しさ,"due":"次に出る日 YYYY-MM-DD"}',
+      "- これはアプリが同期したときに作る写しです。アプリを開いていない間の変更は入っていません（updated_at で時刻が分かります）",
+      "- 追加・削除を送った直後は、アプリが取り込むまで写しに反映されません",
+      "- 404 や 403 のときは、トークンが無効か、まだ写しが作られていません（アプリで同期画面を開くと作られます）",
+      "",
       "■ curl の例（追加）",
       "curl -X POST '" + url + "' -H 'Content-Type: application/json' -d '" + JSON.stringify(body) + "'",
       "",
       "■ curl の例（削除）",
       "curl -X POST '" + url + "' -H 'Content-Type: application/json' -d '" + JSON.stringify(delBody) + "'",
+      "",
+      "■ curl の例（取得。jq で中身の JSON を取り出す）",
+      "curl -s '" + readBase + "?key=" + c.apiKey + "' | jq -r '.fields.json.stringValue' | jq .",
+      "curl -s '" + readBase + "/parts/0?key=" + c.apiKey + "' | jq -r '.fields.json.stringValue' | jq .",
     ].join("\n");
   }
 
@@ -2100,6 +2264,8 @@ class App extends Component {
       "kioku.sync.base",
       "kioku.sync.seeded",
     ].forEach((k) => localStorage.removeItem(k));
+    this.apiTokenValue = null;
+    this.apiExportHash = null;
   }
 
   queuePush() {
@@ -4503,11 +4669,11 @@ class App extends Component {
 
         ${s.syncUser &&
         html`<div style=${Object.assign({}, box, { marginBottom: 16 })}>
-          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>API でカードを追加・削除</div>
+          <div style=${{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>API でカードを追加・削除・取得</div>
           <div style=${{ fontSize: 13, color: C.muted, lineHeight: 1.7, marginBottom: 14 }}>
-            AI（Claude Code など、プログラムを実行できるもの）からカードを追加・削除できるようにします。
+            AI（Claude Code など、プログラムを実行できるもの）からカードを追加・削除・取得できるようにします。
             トークンを発行して「AI に渡す説明をコピー」を押し、そのまま AI に貼ってください。
-            届いた追加・削除は、アプリを開いたときに反映されます。
+            届いた追加・削除は、アプリを開いたときに反映されます。取得で読めるのは、アプリが最後に同期したときの内容です。
           </div>
           ${s.apiToken
             ? html`<div style=${{ display: "grid", gap: 10 }}>
@@ -4553,7 +4719,7 @@ class App extends Component {
                   </button>
                 </div>
                 <div style=${{ fontSize: 11, color: C.faint, lineHeight: 1.7 }}>
-                  このトークンを知っている人は、あなたのアカウントのカードを追加・削除できます（読み取りはできません）。
+                  このトークンを知っている人は、あなたのアカウントのカードを読み取り・追加・削除できます。
                   漏れたかもしれないときは「発行し直す」を押してください。
                 </div>
               </div>`
