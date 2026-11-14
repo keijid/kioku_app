@@ -11,7 +11,7 @@ const DAY = 86400000;
 const ACCENTS = ["#B8452C", "#3E7C6B", "#3B4C86", "#96702A", "#6B4E7C"];
 const IMPORT_MAX = 2000; // 一度に取り込める上限枚数
 // 同期画面に表示する版数。sw.js の CACHE と揃えて上げること（今どのビルドが動いているかの確認用）。
-const BUILD = "v42";
+const BUILD = "v43";
 
 const C = {
   bg: "#F3EFE6",
@@ -465,6 +465,8 @@ class App extends Component {
     editBack: "",
     editHint: "",
     confirmingDelete: false,
+    // 学習画面の「削除」を1回押したカードの ID（もう一度押すと削除）
+    studyDeleteId: null,
     // デッキ名のその場編集。真のとき見出しが入力欄に切り替わります
     renamingDeck: false,
     renameName: "",
@@ -877,6 +879,31 @@ class App extends Component {
     };
     this.setState(next);
     this.persist(next);
+  }
+
+  // 学習画面から出題中のカードを削除します。誤タップ防止のため2回押し（studyDeleteId）。
+  // 出題キューと Undo の履歴からも取り除きます。履歴に残すと「ひとつ戻す」で
+  // 消えたカードの ID がキューに戻り、中身の無い出題になるためです。
+  deleteFromStudy(id) {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    const s = this.state;
+    const cards = s.cards.filter((c) => c.id !== id);
+    const queue = s.queue.filter((x) => x !== id);
+    const history = s.history
+      .filter((h) => h.card.id !== id)
+      .map((h) => Object.assign({}, h, { queue: h.queue.filter((x) => x !== id) }));
+    const next = {
+      cards,
+      queue,
+      history,
+      showAnswer: false,
+      editId: null,
+      studyDeleteId: null,
+      screen: queue.length ? "study" : "done",
+    };
+    this.setState(next);
+    this.persist({ cards });
+    this.toast("カードを削除しました");
   }
 
   bury() {
@@ -3254,6 +3281,23 @@ class App extends Component {
                 onClick=${() => this.startEdit(card)}
               >
                 編集
+              </button>`}
+              ${card &&
+              !editing &&
+              html`<button
+                class="danger"
+                style=${{
+                  background: s.studyDeleteId === card.id ? "#FBEDE9" : "none",
+                  border: "1px solid " + (s.studyDeleteId === card.id ? C.red : C.line),
+                  borderRadius: 99,
+                  padding: "4px 12px",
+                  fontSize: 12,
+                  color: s.studyDeleteId === card.id ? C.red : C.muted,
+                }}
+                onClick=${() =>
+                  s.studyDeleteId === card.id ? this.deleteFromStudy(card.id) : this.setState({ studyDeleteId: card.id })}
+              >
+                ${s.studyDeleteId === card.id ? "本当に削除" : "削除"}
               </button>`}
               <span style=${{ background: C.bg, borderRadius: 99, padding: "4px 12px", color: C.muted }}>
                 ${editing ? "編集中" : card ? stateLabels[card.state] || "復習" : ""}
